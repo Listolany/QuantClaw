@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment and secrets
+.env
+*.env
+
+# Runtime outputs
+*.log
+*.err
+*.html
+*.png
+*.json
+
+# Keep source JSON docs, ignore runtime JSON under backtests
+!QMT-TradingClaw/qgdata_docs/**/*.json
+
+# Orchestrator runtime folders
+QMT-TradingClaw/backtests/orchestrator_runs/
+QMT-TradingClaw/backtests/.run_lock
+
+# Build artifacts
+*.egg-info/
+.pytest_cache/
