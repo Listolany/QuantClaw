@@ -933,6 +933,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
         monitor_step(monitor_base, step="9", status="failed", title="执行失败", msg=str(exc)[:200], run_id=run_id)
         store.save(state)
         return 1
+    finally:
+        monitor_post(monitor_base, "/api/done", {})
+        mon_pid = state.get("process", {}).get("monitor_pid")
+        if mon_pid:
+            try: os.kill(mon_pid, 15)
+            except OSError: pass
 
 
 def cmd_status(args: argparse.Namespace) -> int:

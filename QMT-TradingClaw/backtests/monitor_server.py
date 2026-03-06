@@ -402,6 +402,9 @@ def _kill_port(port):
         except Exception: return
     print(f"[warn] 端口 {port} 清理 3 次仍被占用", flush=True)
 
+MONITOR_MAX_IDLE_SEC = int(os.environ.get("MONITOR_MAX_IDLE_SEC", "1800"))  # 30min 兜底自杀
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -414,9 +417,15 @@ def main():
     shown_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     print(f"[monitor] http://{shown_host}:{args.port}/runs/{args.run_id}", flush=True)
     print(f"[monitor] pid={os.getpid()}", flush=True)
+    boot = time.time()
     def auto_stop():
-        while not STATE["done"]: time.sleep(1)
-        time.sleep(300); srv.shutdown()
+        while not STATE["done"]:
+            if time.time() - boot > MONITOR_MAX_IDLE_SEC:
+                print(f"[monitor] idle timeout ({MONITOR_MAX_IDLE_SEC}s), shutting down", flush=True)
+                break
+            time.sleep(2)
+        time.sleep(5 if not STATE["done"] else 300)
+        srv.shutdown()
     threading.Thread(target=auto_stop, daemon=True).start()
     try: srv.serve_forever()
     except KeyboardInterrupt: pass
