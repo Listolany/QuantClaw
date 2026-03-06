@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +33,7 @@ MONITOR_SERVER = BACKTESTS_DIR / "monitor_server.py"
 BACKTEST_RUNNER = BACKTESTS_DIR / "backtest_runner.py"
 STATE_VERSION = 1
 MONITOR_BIND_HOST = os.getenv("ORCH_MONITOR_BIND_HOST", "0.0.0.0")
+DEFAULT_REPORT_PUBLIC_DIR = (BACKTESTS_DIR / "public_reports").resolve()
 
 
 def now_iso() -> str:
@@ -92,6 +94,37 @@ def resolve_qgdata_token(explicit_token: str) -> str:
         "QGDATA_TOKEN",
         [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")],
     )
+
+
+def resolve_monitor_public_base(explicit_base: str) -> str:
+    """解析监控公网基址（优先显式参数，其次环境变量/配置文件/控制台URL推导）"""
+    if explicit_base and explicit_base.strip():
+        return explicit_base.strip().rstrip("/")
+    env_base = os.getenv("MONITOR_PUBLIC_BASE", "").strip()
+    if env_base:
+        return env_base.rstrip("/")
+    file_base = read_env_value_from_files(
+        "MONITOR_PUBLIC_BASE",
+        [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")],
+    ).strip()
+    if file_base:
+        return file_base.rstrip("/")
+    control_url = (
+        os.getenv("OPENCLAW_CONTROL_URL", "").strip()
+        or read_env_value_from_files(
+            "OPENCLAW_CONTROL_URL",
+            [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")],
+        ).strip()
+    )
+    if control_url:
+        try:
+            pu = urlparse(control_url)
+            if pu.scheme in ("http", "https") and pu.hostname:
+                port = f":{pu.port}" if pu.port else ""
+                return f"{pu.scheme}://{pu.hostname}{port}"
+        except Exception:
+            pass
+    return ""
 
 
 def resolve_symbols_by_name(requirement: str, token: str) -> list[str]:
@@ -176,19 +209,18 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     }
 
 
-def pick_free_port(start: int = 8765, end: int = 8999, candidates: Optional[list[int]] = None) -> int:
-    if candidates:
-        for port in candidates:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if sock.connect_ex(("127.0.0.1", port)) != 0:
-                    return port
-    for port in range(start, end + 1):
+DEFAULT_MONITOR_PORTS = [8767]  # 白名单端口，必须在防火墙/安全组中放通
+
+
+def pick_free_port(candidates: Optional[list[int]] = None) -> int:
+    ports = candidates or DEFAULT_MONITOR_PORTS
+    for port in ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if sock.connect_ex(("127.0.0.1", port)) != 0:
                 return port
-    raise RuntimeError("No free monitor port available")
+    tried = ",".join(str(p) for p in ports)
+    raise RuntimeError(f"白名单端口均被占用({tried})，请释放端口或通过 ORCH_MONITOR_PORT_CANDIDATES 扩展白名单")
 
 
 def monitor_get(base_url: str, path: str, timeout: float = 3.0) -> Optional[str]:
@@ -259,6 +291,193 @@ def validate_monitor_public_base(base: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def validate_strategy_file(filepath: str) -> Tuple[bool, str]:
+    """校验策略文件路径安全性：必须在 STRATEGIES_DIR 内且为 .py 文件"""
+    p = Path(filepath).resolve()
+    if not p.suffix == ".py":
+        return False, f"strategy file must be .py, got: {p.suffix}"
+    if not p.exists():
+        return False, f"strategy file not found: {p}"
+    try:
+        if not str(p).startswith(str(STRATEGIES_DIR.resolve())):
+            return False, f"strategy file must be under {STRATEGIES_DIR}, got: {p}"
+    except Exception as exc:
+        return False, f"path resolution error: {exc}"
+    return True, ""
+
+
+def detect_strategy_class(filepath: Path) -> str:
+    """从策略文件中自动检测 Strategy 类名"""
+    try:
+        content = filepath.read_text(encoding="utf-8")
+        classes = re.findall(r"^class\s+(\w*Strategy\w*)\s*[\(:]", content, re.MULTILINE)
+        return classes[0] if classes else ""
+    except Exception:
+        return ""
+
+
+def normalize_public_base(base: str) -> str:
+    return (base or "").strip().rstrip("/")
+
+
+def public_url(base: str, name: str) -> str:
+    return f"{normalize_public_base(base)}/{name}" if normalize_public_base(base) else ""
+
+
+def publish_static_reports(
+    *,
+    run_id: str,
+    output_prefix: str,
+    report_public_base: str,
+    report_public_dir: str,
+) -> Tuple[Dict[str, str], str]:
+    base = normalize_public_base(report_public_base)
+    if not base:
+        return {}, "REPORT_PUBLIC_BASE not configured"
+    try:
+        target_dir = Path(report_public_dir).expanduser().resolve() if report_public_dir else DEFAULT_REPORT_PUBLIC_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        published: Dict[str, str] = {}
+        mapping = {
+            f"{output_prefix}_report.html": f"{run_id}_report.html",
+            f"{output_prefix}.html": f"{run_id}.html",
+            f"{output_prefix}_replay.html": f"{run_id}_replay.html",
+            f"{output_prefix}_summary.json": f"{run_id}_summary.json",
+            f"{output_prefix}.png": f"{run_id}.png",
+        }
+        for src_name, dst_name in mapping.items():
+            src = BACKTESTS_DIR / src_name
+            if not src.exists():
+                continue
+            dst = target_dir / dst_name
+            shutil.copy2(src, dst)
+            published[dst_name] = public_url(base, dst_name)
+        return published, ""
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def generate_report_html(*, run_id: str, report_data: Dict, summary: Dict, strategy_code: str = "", parsed: Dict = None) -> str:
+    """生成自包含持久化报告 HTML（Tab分区 + 指标置顶 + echarts 图表）"""
+    import html as _html
+    stats = report_data.get("stats", summary.get("stats", {}))
+    dates_json = json.dumps(report_data.get("dates", []), ensure_ascii=False)
+    navs_json = json.dumps(report_data.get("navs", []))
+    bench_json = json.dumps(report_data.get("bench", []))
+    trades_json = json.dumps(report_data.get("trades", []), ensure_ascii=False)
+    stats_json = json.dumps(stats, ensure_ascii=False)
+    code_escaped = _html.escape(strategy_code or "")
+    p = parsed or {}
+    meta = {k: str(v) for k, v in {**p, "run_id": run_id}.items() if v}
+    meta_json = json.dumps(meta, ensure_ascii=False)
+    return f'''<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>回测报告 - {run_id}</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js"></script>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc;color:#1e293b;min-height:100vh}}
+.hdr{{background:linear-gradient(135deg,#1e40af,#3b82f6);color:#fff;padding:28px 32px}}
+.hdr h1{{font-size:24px;font-weight:800}}.hdr .sub{{font-size:13px;opacity:.8;margin-top:6px;font-family:monospace}}
+.mx{{max-width:1200px;margin:0 auto;padding:24px 20px}}
+.metrics{{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px;margin-bottom:24px}}
+.mc{{background:#fff;border-radius:14px;padding:18px;text-align:center;border:1px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+.mc .lb{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;font-weight:600}}
+.mc .vl{{font-size:24px;font-weight:800;margin-top:6px}}
+.mc .vl.pos{{color:#16a34a}}.mc .vl.neg{{color:#dc2626}}.mc .vl.neu{{color:#475569}}
+.tabs{{display:flex;gap:4px;background:#fff;border-radius:12px;padding:4px;border:1px solid #e2e8f0;margin-bottom:20px}}
+.tab{{padding:10px 20px;border-radius:8px;border:none;background:transparent;cursor:pointer;font-size:14px;font-weight:600;color:#64748b;transition:all .2s}}
+.tab.active{{background:#2563eb;color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.25)}}
+.tab:hover:not(.active){{background:#f1f5f9}}
+.panel{{display:none;background:#fff;border-radius:14px;border:1px solid #e2e8f0;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
+.panel.active{{display:block}}
+.chart-box{{width:100%;height:400px}}
+.chart-box2{{width:100%;height:280px;margin-top:20px}}
+.tt{{width:100%;border-collapse:collapse;font-size:13px}}
+.tt th{{background:#f8fafc;color:#64748b;font-weight:600;text-align:left;padding:12px 14px;border-bottom:2px solid #e2e8f0;font-size:11px;text-transform:uppercase}}
+.tt td{{padding:12px 14px;border-bottom:1px solid #f1f5f9}}
+.tt tr:hover{{background:#f8fafc}}
+.tt .buy{{color:#16a34a;font-weight:600}}.tt .sell{{color:#dc2626;font-weight:600}}
+.pn{{display:flex;justify-content:center;gap:6px;margin-top:14px}}
+.pn button{{padding:6px 12px;border:1px solid #e2e8f0;background:#fff;border-radius:6px;cursor:pointer;font-size:12px}}
+.pn button.act{{background:#2563eb;color:#fff;border-color:#2563eb}}
+pre.cb{{background:#fafafa;margin:0;padding:16px;font-size:13px;max-height:500px;overflow:auto;line-height:1.7;border-radius:10px;border:1px solid #e2e8f0}}
+pre.cb code{{font-family:'Cascadia Code','Fira Code','Consolas',monospace}}
+.info-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}}
+.info-item{{background:#f8fafc;border-radius:10px;padding:14px;border:1px solid #e2e8f0}}
+.info-item .ik{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;font-weight:600}}
+.info-item .iv{{font-size:14px;font-weight:600;margin-top:6px;color:#1e293b;word-break:break-all}}
+.ft{{text-align:center;padding:24px;font-size:12px;color:#94a3b8}}
+</style></head><body>
+<div class="hdr"><h1>回测报告</h1><div class="sub">run: {run_id} | generated: {now_iso()}</div></div>
+<div class="mx">
+<div class="metrics" id="metricsRow"></div>
+<div class="tabs" id="tabBar">
+  <button class="tab active" data-t="equity">收益分析</button>
+  <button class="tab" data-t="trades">交易明细</button>
+  <button class="tab" data-t="code">策略代码</button>
+  <button class="tab" data-t="info">运行信息</button>
+</div>
+<div class="panel active" id="p-equity"><div class="chart-box" id="eqChart"></div><div class="chart-box2" id="dayChart"></div></div>
+<div class="panel" id="p-trades"><div id="tradeArea"></div><div class="pn" id="tradeNav"></div></div>
+<div class="panel" id="p-code"><pre class="cb"><code class="language-python">{code_escaped}</code></pre></div>
+<div class="panel" id="p-info"><div class="info-grid" id="infoGrid"></div></div>
+</div>
+<div class="ft">Generated by QuantClaw | {run_id}</div>
+<script>
+const D={dates_json},N={navs_json},B={bench_json},T={trades_json},S={stats_json},M={meta_json};
+/* --- metrics --- */
+(function(){{
+const fmt={{total_return:['总收益率',1],annual_return:['年化收益',1],max_ddpercent:['最大回撤',1],sharpe_ratio:['夏普比率',0],total_trade_count:['交易次数',0],winning_rate:['胜率',1],profit_days:['盈利天数',0],loss_days:['亏损天数',0]}};
+let h='';for(const[k,[lb,isPct]] of Object.entries(fmt)){{const v=S[k];if(v===undefined)continue;
+const n=typeof v==='number';let d=n?(isPct?v.toFixed(2)+'%':v.toFixed(4)):v;
+const c=n?(v>=0?'pos':'neg'):'neu';h+='<div class="mc"><div class="lb">'+lb+'</div><div class="vl '+c+'">'+d+'</div></div>'}}
+document.getElementById('metricsRow').innerHTML=h}})();
+/* --- tabs --- */
+document.querySelectorAll('.tab').forEach(b=>b.onclick=function(){{
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));b.classList.add('active');
+document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+document.getElementById('p-'+b.dataset.t).classList.add('active')}});
+/* --- equity chart --- */
+(function(){{
+const ch=echarts.init(document.getElementById('eqChart'));
+ch.setOption({{animation:true,tooltip:{{trigger:'axis'}},legend:{{data:['策略净值','沪深300基准'],top:10,right:16}},
+grid:{{left:64,right:32,top:52,bottom:48}},
+xAxis:{{type:'category',data:D,axisLabel:{{color:'#94a3b8',fontSize:11}},boundaryGap:false}},
+yAxis:{{type:'value',name:'净值',min:'dataMin',axisLabel:{{color:'#64748b',formatter:v=>v.toFixed(2)}},splitLine:{{lineStyle:{{color:'#f1f5f9'}}}}}},
+series:[{{name:'策略净值',type:'line',data:N,smooth:.25,lineStyle:{{width:3,color:'#2563eb'}},areaStyle:{{color:{{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{{offset:0,color:'rgba(37,99,235,.12)'}},{{offset:1,color:'rgba(37,99,235,0)'}}]}}}},symbol:'none'}},
+{{name:'沪深300基准',type:'line',data:B,smooth:.25,lineStyle:{{width:2,color:'#dc2626',type:'dashed'}},symbol:'none'}}]}});
+const dc=echarts.init(document.getElementById('dayChart'));
+const dd=[],dl=[];for(let i=1;i<N.length&&i<D.length;i++){{const p=N[i-1]||1;dd.push(((N[i]-p)/p*100).toFixed(3));dl.push(D[i])}}
+dc.setOption({{animation:true,tooltip:{{trigger:'axis'}},grid:{{left:56,right:24,top:36,bottom:48}},
+xAxis:{{type:'category',data:dl,axisLabel:{{color:'#94a3b8',fontSize:10}}}},
+yAxis:{{type:'value',name:'日收益%',axisLabel:{{color:'#64748b',formatter:v=>v.toFixed(2)+'%'}},splitLine:{{lineStyle:{{color:'#f1f5f9'}}}}}},
+series:[{{type:'bar',data:dd.map(v=>parseFloat(v)),itemStyle:{{color:function(p){{return p.data>=0?'#16a34a':'#dc2626'}}}},barWidth:'60%'}}]}});
+window.addEventListener('resize',()=>{{ch.resize();dc.resize()}})
+}})();
+/* --- trades --- */
+(function(){{
+let pg=1;const ps=15;
+function render(){{
+const s=(pg-1)*ps,page=T.slice(s,s+ps);
+let h='<table class="tt"><thead><tr><th>日期</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr></thead><tbody>';
+page.forEach(t=>{{const ib=t.direction==='买入'||t.direction==='BUY';h+='<tr><td>'+t.date+'</td><td class="'+(ib?'buy':'sell')+'">'+(ib?'买入':'卖出')+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td></tr>'}});
+h+='</tbody></table>';document.getElementById('tradeArea').innerHTML=h||'<div style="color:#94a3b8;text-align:center;padding:40px">暂无交易记录</div>';
+const tp=Math.ceil(T.length/ps),nav=document.getElementById('tradeNav');
+if(tp>1){{let p='';for(let i=1;i<=tp;i++)p+='<button class="'+(i===pg?'act':'')+'" onclick="window._tp('+i+')">'+i+'</button>';nav.innerHTML=p}}else nav.innerHTML=''}}
+window._tp=function(n){{pg=n;render()}};render()
+}})();
+/* --- info --- */
+(function(){{
+let h='';for(const[k,v] of Object.entries(M))h+='<div class="info-item"><div class="ik">'+k+'</div><div class="iv">'+v+'</div></div>';
+document.getElementById('infoGrid').innerHTML=h||'<div style="color:#94a3b8">无额外信息</div>'}})();
+hljs.highlightAll();
+</script></body></html>'''
+
+
 class RunStore:
     def __init__(self, run_id: str):
         self.run_id = run_id
@@ -327,14 +546,15 @@ def wait_monitor_ready(base_url: str, timeout_sec: int = 20) -> bool:
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    ok, err = validate_monitor_public_base(args.monitor_public_base)
+    resolved_monitor_public_base = resolve_monitor_public_base(args.monitor_public_base)
+    ok, err = validate_monitor_public_base(resolved_monitor_public_base)
     if not ok:
         print(
             json.dumps(
                 {
                     "status": "config_missing",
                     "error": err,
-                    "next_action": "请先配置公网 MONITOR_PUBLIC_BASE（例如 http://<public-ip-or-domain>）",
+                    "next_action": "请先配置公网 MONITOR_PUBLIC_BASE，或配置 OPENCLAW_CONTROL_URL 让系统自动推导（例如 https://your-control-host）",
                 },
                 ensure_ascii=False,
             )
@@ -362,25 +582,41 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    port_start = int(os.getenv("ORCH_MONITOR_PORT_START", str(args.monitor_port_start)))
-    port_end = int(os.getenv("ORCH_MONITOR_PORT_END", str(args.monitor_port_end)))
     raw_candidates = args.monitor_port_candidates or os.getenv("ORCH_MONITOR_PORT_CANDIDATES", "")
     candidate_ports: list[int] = []
     if raw_candidates:
-        for token in raw_candidates.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                candidate_ports.append(int(token))
-            except ValueError:
-                continue
-    monitor_port = args.monitor_port or pick_free_port(port_start, port_end, candidate_ports)
+        for tok in raw_candidates.split(","):
+            tok = tok.strip()
+            if tok:
+                try: candidate_ports.append(int(tok))
+                except ValueError: pass
+    monitor_port = args.monitor_port or pick_free_port(candidate_ports or None)
     monitor_base = f"http://127.0.0.1:{monitor_port}"
-    monitor_url = f"{args.monitor_public_base.rstrip('/')}:{monitor_port}/runs/{run_id}"
+    monitor_url = f"{resolved_monitor_public_base.rstrip('/')}:{monitor_port}/runs/{run_id}"
     monitor_url_local = f"http://127.0.0.1:{monitor_port}/runs/{run_id}"
+    report_public_base = normalize_public_base(args.report_public_base)
+    report_url = public_url(report_public_base, f"{run_id}.html")
+    report_replay_url = public_url(report_public_base, f"{run_id}_replay.html")
+    report_summary_url = public_url(report_public_base, f"{run_id}_summary.json")
     public_reachable = False
     public_probe_error = "probe_pending"
+    strategy_file = ""
+    strategy_module = args.strategy_module
+    strategy_class = args.strategy_class
+    if args.strategy_file:
+        sf_ok, sf_err = validate_strategy_file(args.strategy_file)
+        if not sf_ok:
+            print(json.dumps({"status": "error", "error": sf_err, "next_action": "请检查策略文件路径"}, ensure_ascii=False))
+            return 1
+        strategy_file = str(Path(args.strategy_file).resolve())
+        if not strategy_module:
+            strategy_module = Path(strategy_file).stem
+        if not strategy_class:
+            strategy_class = detect_strategy_class(Path(strategy_file))
+            if not strategy_class:
+                print(json.dumps({"status": "error", "error": f"无法在 {strategy_file} 中检测到 Strategy 类", "next_action": "请通过 --strategy-class 显式指定"}, ensure_ascii=False))
+                return 1
+
     payload = {
         "requirement": args.requirement,
         "parsed": parsed,
@@ -389,8 +625,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "monitor_base": monitor_base,
         "monitor_url": monitor_url,
         "monitor_url_local": monitor_url_local,
+        "monitor_public_base": resolved_monitor_public_base,
         "monitor_public_reachable": public_reachable,
         "monitor_public_probe_error": public_probe_error,
+        "report_public_base": report_public_base,
+        "report_public_dir": args.report_public_dir,
+        "report_url": report_url,
+        "report_replay_url": report_replay_url,
+        "report_summary_url": report_summary_url,
         "start": args.start,
         "end": args.end,
         "interval": args.interval or parsed["interval"],
@@ -403,6 +645,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "python_bin": args.python_bin or DEFAULT_PYTHON_BIN,
         "qgdata_token_present": bool(resolved_token),
         "timeout_sec": args.timeout_sec,
+        "strategy_file": strategy_file,
+        "strategy_module": strategy_module,
+        "strategy_class": strategy_class,
     }
     state = store.init_state(payload)
 
@@ -426,11 +671,25 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "error", "error": "monitor startup failed", "run_id": run_id}, ensure_ascii=False))
         return 1
 
-    public_reachable, public_probe_error = probe_monitor_url(monitor_url, timeout=1.5)
+    public_reachable, public_probe_error = probe_monitor_url(monitor_url, timeout=3.0)
     payload["monitor_public_reachable"] = public_reachable
     payload["monitor_public_probe_error"] = public_probe_error
     state["payload"] = payload
     store.save(state)
+
+    if not public_reachable:
+        try: mon_proc.kill()
+        except Exception: pass
+        state["status"] = "failed"
+        store.append_error(state, f"monitor公网不可达: {public_probe_error}")
+        store.save(state)
+        print(json.dumps({
+            "status": "config_missing",
+            "error": f"monitor_url 公网不可达: {monitor_url} ({public_probe_error})",
+            "monitor_port": monitor_port,
+            "next_action": f"请确认: 1) MONITOR_PUBLIC_BASE 指向正确的公网地址; 2) 防火墙/安全组已放通端口 {monitor_port}; 3) 运行 config-doctor 一键诊断: python3 pipeline_orchestrator.py config-doctor",
+        }, ensure_ascii=False))
+        return 1
 
     monitor_post(monitor_base, "/api/requirement", {"requirement": args.requirement, **parsed, "run_id": run_id})
     monitor_step(monitor_base, step="1", status="success", title="需求确认", msg="监控页面已启动", run_id=run_id)
@@ -452,8 +711,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "run_id": run_id,
                 "monitor_url": monitor_url,
                 "monitor_url_local": monitor_url_local,
+                "monitor_public_base": resolved_monitor_public_base,
                 "monitor_public_reachable": public_reachable,
                 "monitor_public_probe_error": public_probe_error,
+                "report_url": report_url,
+                "report_replay_url": report_replay_url,
+                "report_summary_url": report_summary_url,
                 "state_file": str(store.state_file),
                 "worker_pid": worker_proc.pid,
             },
@@ -473,24 +736,65 @@ def cmd_worker(args: argparse.Namespace) -> int:
     parsed = payload["parsed"]
     output_prefix = f"run_{run_id}"
 
-    try:
-        monitor_step(monitor_base, step="2", status="running", title="策略生成", msg="正在生成策略代码", run_id=run_id)
-        module_name = f"auto_ma_{run_id}".lower()
-        class_name = "AutoMaCrossStrategy"
-        strategy_file = STRATEGIES_DIR / f"{module_name}.py"
-        source = strategy_source(class_name, parsed["fast_window"], parsed["slow_window"], "quant-strategy-assistant", parsed["direction"])
-        strategy_file.write_text(source, encoding="utf-8")
-        subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file)], check=True, cwd=str(PROJECT_ROOT))
-        monitor_post(
-            monitor_base,
-            "/api/code",
-            {"filename": strategy_file.name, "content": source},
-        )
-        monitor_step(monitor_base, step="2", status="success", title="策略生成", msg=f"策略已生成: {strategy_file.name}", run_id=run_id)
-        monitor_step(monitor_base, step="3", status="success", title="策略代码", msg=f"策略已生成并推送: {strategy_file.name}", run_id=run_id)
-        state["artifacts"]["strategy_file"] = str(strategy_file)
-        store.mark_step(state, "strategy_generation", "success", strategy_file.name)
+    def _structured_error(state_: Dict, error_type: str, step: str, message: str, tb: str = "") -> None:
+        """保存结构化错误到 state"""
+        state_["errors"].append({"at": now_iso(), "error_type": error_type, "step": step, "message": message, "traceback": tb[:4000]})
+        store.save(state_)
+        monitor_post(monitor_base, "/api/error", {"error_type": error_type, "step": step, "message": message, "traceback": tb[:2000]})
 
+    def _fail_report(state_: Dict, error_msg: str) -> None:
+        """失败时也生成最小 report HTML"""
+        try:
+            code = ""
+            sf = state_.get("artifacts", {}).get("strategy_file", "") or state_.get("artifacts", {}).get("strategy_snapshot", "")
+            if sf and Path(sf).exists():
+                try: code = Path(sf).read_text(encoding="utf-8")
+                except Exception: pass
+            fail_data = {"dates": [], "navs": [], "bench": [], "trades": [], "stats": {}}
+            fail_summary = {"stats": {"error": error_msg}}
+            html = generate_report_html(run_id=run_id, report_data=fail_data, summary=fail_summary, strategy_code=code, parsed=parsed)
+            rpath = BACKTESTS_DIR / f"{output_prefix}_report.html"
+            rpath.write_text(html, encoding="utf-8")
+            state_["artifacts"]["report_html"] = str(rpath)
+            published, _ = publish_static_reports(run_id=run_id, output_prefix=output_prefix, report_public_base=payload.get("report_public_base", ""), report_public_dir=payload.get("report_public_dir", ""))
+            if published:
+                state_["artifacts"]["report_public_urls"] = published
+                payload["report_url"] = published.get(f"{run_id}_report.html", payload.get("report_url", ""))
+                state_["payload"] = payload
+            store.save(state_)
+        except Exception:
+            pass
+
+    try:
+        ext_strategy_file = payload.get("strategy_file", "")
+        if ext_strategy_file and Path(ext_strategy_file).exists():
+            monitor_step(monitor_base, step="2", status="running", title="策略加载", msg="加载外部策略文件", run_id=run_id)
+            module_name = payload.get("strategy_module", "") or Path(ext_strategy_file).stem
+            class_name = payload.get("strategy_class", "") or detect_strategy_class(Path(ext_strategy_file))
+            snapshot_path = store.run_dir / "strategy_snapshot.py"
+            shutil.copy2(ext_strategy_file, snapshot_path)
+            state["artifacts"]["strategy_snapshot"] = str(snapshot_path)
+            strategy_file_path = Path(ext_strategy_file)
+            source = strategy_file_path.read_text(encoding="utf-8")
+            monitor_post(monitor_base, "/api/code", {"filename": strategy_file_path.name, "content": source})
+            monitor_step(monitor_base, step="2", status="success", title="策略加载", msg=f"外部策略已加载: {strategy_file_path.name}", run_id=run_id)
+            state["artifacts"]["strategy_file"] = ext_strategy_file
+            state["status"] = "code_ready"
+            store.mark_step(state, "strategy_generation", "success", f"external: {strategy_file_path.name}")
+        else:
+            monitor_step(monitor_base, step="2", status="running", title="策略生成", msg="正在生成策略代码", run_id=run_id)
+            module_name = f"auto_ma_{run_id}".lower()
+            class_name = "AutoMaCrossStrategy"
+            strategy_file_path = STRATEGIES_DIR / f"{module_name}.py"
+            source = strategy_source(class_name, parsed["fast_window"], parsed["slow_window"], "quant-strategy-assistant", parsed["direction"])
+            strategy_file_path.write_text(source, encoding="utf-8")
+            subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
+            monitor_post(monitor_base, "/api/code", {"filename": strategy_file_path.name, "content": source})
+            monitor_step(monitor_base, step="2", status="success", title="策略生成", msg=f"策略已生成: {strategy_file_path.name}", run_id=run_id)
+            state["artifacts"]["strategy_file"] = str(strategy_file_path)
+            store.mark_step(state, "strategy_generation", "success", strategy_file_path.name)
+
+        monitor_step(monitor_base, step="3", status="success", title="策略就绪", msg=f"策略已就绪: {module_name}.{class_name}", run_id=run_id)
         monitor_step(monitor_base, step="4", status="running", title="回测执行", msg="回测已启动", run_id=run_id)
         cmd = [
             payload["python_bin"],
@@ -556,6 +860,37 @@ def cmd_worker(args: argparse.Namespace) -> int:
             summary = read_json(summary_path)
             state["artifacts"]["summary_file"] = str(summary_path)
             state["artifacts"]["summary"] = summary
+            report_data_path = BACKTESTS_DIR / f"{output_prefix}_report_data.json"
+            report_data = read_json(report_data_path) if report_data_path.exists() else {}
+            strategy_code = ""
+            sf = state["artifacts"].get("strategy_file", "")
+            if sf and Path(sf).exists():
+                try: strategy_code = Path(sf).read_text(encoding="utf-8")
+                except Exception: pass
+            report_html = generate_report_html(run_id=run_id, report_data=report_data, summary=summary, strategy_code=strategy_code, parsed=parsed)
+            report_html_path = BACKTESTS_DIR / f"{output_prefix}_report.html"
+            report_html_path.write_text(report_html, encoding="utf-8")
+            state["artifacts"]["report_html"] = str(report_html_path)
+            published_reports, publish_err = publish_static_reports(
+                run_id=run_id,
+                output_prefix=output_prefix,
+                report_public_base=payload.get("report_public_base", ""),
+                report_public_dir=payload.get("report_public_dir", ""),
+            )
+            if published_reports:
+                state["artifacts"]["report_public_urls"] = published_reports
+                payload["report_url"] = published_reports.get(f"{run_id}_report.html", published_reports.get(f"{run_id}.html", payload.get("report_url", "")))
+                payload["report_replay_url"] = published_reports.get(f"{run_id}_replay.html", payload.get("report_replay_url", ""))
+                payload["report_summary_url"] = published_reports.get(f"{run_id}_summary.json", payload.get("report_summary_url", ""))
+                state["payload"] = payload
+            elif publish_err and publish_err != "REPORT_PUBLIC_BASE not configured":
+                store.append_error(state, f"report publish warning: {publish_err}")
+            report_url_final = payload.get("report_url", "")
+            monitor_post(monitor_base, "/api/report_urls", {
+                "report_url": report_url_final,
+                "report_replay_url": payload.get("report_replay_url", ""),
+                "report_summary_url": payload.get("report_summary_url", ""),
+            })
             monitor_step(monitor_base, step="5", status="success", title="结果展示", msg="回测完成，结果已生成", run_id=run_id)
             store.mark_step(state, "result", "success", str(summary_path))
         else:
@@ -564,16 +899,48 @@ def cmd_worker(args: argparse.Namespace) -> int:
         state["status"] = "completed"
         store.save(state)
         return 0
-    except Exception as exc:
+    except subprocess.CalledProcessError as exc:
+        import traceback as _tb
         state["status"] = "failed"
-        store.append_error(state, str(exc))
-        monitor_step(monitor_base, step="9", status="failed", title="执行失败", msg=str(exc), run_id=run_id)
+        _structured_error(state, "compile_error", "strategy_generation", str(exc), _tb.format_exc())
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="编译失败", msg=str(exc)[:200], run_id=run_id)
+        store.save(state)
+        return 1
+    except TimeoutError as exc:
+        import traceback as _tb
+        state["status"] = "failed"
+        _structured_error(state, "timeout_error", "backtest_execution", str(exc), _tb.format_exc())
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="回测超时", msg=str(exc)[:200], run_id=run_id)
+        store.save(state)
+        return 1
+    except RuntimeError as exc:
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        etype = "data_error" if any(k in str(exc) for k in ["0 bars", "无数据", "data", "token"]) else "runtime_error"
+        state["status"] = "failed"
+        _structured_error(state, etype, "backtest_execution", str(exc), tb_str)
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="执行失败", msg=str(exc)[:200], run_id=run_id)
+        store.save(state)
+        return 1
+    except Exception as exc:
+        import traceback as _tb
+        state["status"] = "failed"
+        _structured_error(state, "runtime_error", "unknown", str(exc), _tb.format_exc())
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="执行失败", msg=str(exc)[:200], run_id=run_id)
         store.save(state)
         return 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     state = RunStore(args.run_id).load()
+    errors = state.get("errors", [])
+    if errors:
+        last = errors[-1]
+        state["last_error"] = {"error_type": last.get("error_type", "unknown"), "step": last.get("step", ""), "message": last.get("message", str(last))}
     print(json.dumps(state, ensure_ascii=False, indent=2))
     return 0
 
@@ -589,6 +956,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "status": st.get("status"),
                 "updated_at": st.get("updated_at"),
                 "monitor_url": st.get("payload", {}).get("monitor_url"),
+                "report_url": st.get("payload", {}).get("report_url"),
             }
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -606,12 +974,12 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--monitor-port", type=int, default=0, help="Optional fixed monitor port")
     submit.add_argument(
         "--monitor-port-candidates",
-        default=os.getenv("ORCH_MONITOR_PORT_CANDIDATES", "8761,8767"),
-        help="Preferred monitor ports CSV, e.g. 8761,8767",
+        default=os.getenv("ORCH_MONITOR_PORT_CANDIDATES", ",".join(str(p) for p in DEFAULT_MONITOR_PORTS)),
+        help="白名单端口CSV（必须在防火墙放通），默认 8767",
     )
-    submit.add_argument("--monitor-port-start", type=int, default=8761, help="Monitor port range start")
-    submit.add_argument("--monitor-port-end", type=int, default=8999, help="Monitor port range end")
     submit.add_argument("--monitor-public-base", default=os.getenv("MONITOR_PUBLIC_BASE", ""))
+    submit.add_argument("--report-public-base", default=os.getenv("REPORT_PUBLIC_BASE", ""))
+    submit.add_argument("--report-public-dir", default=os.getenv("REPORT_PUBLIC_DIR", str(DEFAULT_REPORT_PUBLIC_DIR)))
     submit.add_argument("--python-bin", default=DEFAULT_PYTHON_BIN)
     submit.add_argument("--token", default="")
     submit.add_argument("--start", default="")
@@ -624,6 +992,9 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--pricetick", type=float, default=0.01)
     submit.add_argument("--title", default="")
     submit.add_argument("--timeout-sec", type=int, default=int(os.getenv("ORCH_BACKTEST_TIMEOUT_SEC", "1200")))
+    submit.add_argument("--strategy-file", default="", help="Pre-generated strategy .py file path (Shift-Left mode)")
+    submit.add_argument("--strategy-module", default="", help="Strategy module name (default: derived from file)")
+    submit.add_argument("--strategy-class", default="", help="Strategy class name (default: auto-detect from file)")
 
     worker = sub.add_parser("worker", help="Internal worker command")
     worker.add_argument("--run-id", required=True)
@@ -634,7 +1005,115 @@ def build_parser() -> argparse.ArgumentParser:
     ls_cmd = sub.add_parser("list", help="List recent runs")
     ls_cmd.add_argument("--limit", type=int, default=20)
 
+    sub.add_parser("config-doctor", help="一键诊断所有必需配置项")
+
     return parser
+
+
+def cmd_config_doctor(_args: argparse.Namespace) -> int:
+    """逐项校验所有环境配置，输出 PASS/FAIL/WARN 清单"""
+    results: list[Dict[str, str]] = []
+    all_ok = True
+
+    def _check(name: str, ok: bool, val: str, hint: str):
+        nonlocal all_ok
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            all_ok = False
+        results.append({"check": name, "status": status, "value": val or "(空)", "hint": hint})
+
+    def _warn(name: str, val: str, hint: str):
+        results.append({"check": name, "status": "WARN", "value": val or "(空)", "hint": hint})
+
+    root = os.getenv("QMT_PROJECT_ROOT", "")
+    root_ok = bool(root) and Path(root).is_dir() and (Path(root) / "backtests" / "pipeline_orchestrator.py").exists()
+    _check("QMT_PROJECT_ROOT", root_ok, root, "项目根目录，应包含 backtests/pipeline_orchestrator.py" if not root_ok else "OK")
+
+    py = os.getenv("PYTHON_BIN", "") or DEFAULT_PYTHON_BIN
+    py_ok = shutil.which(py) is not None
+    _check("PYTHON_BIN", py_ok, py, f"找不到 {py}，请安装或修正路径" if not py_ok else "OK")
+
+    mpb = resolve_monitor_public_base("")
+    mpb_valid, mpb_err = validate_monitor_public_base(mpb) if mpb else (False, "未配置")
+    _check("MONITOR_PUBLIC_BASE", mpb_valid, mpb, mpb_err if not mpb_valid else "OK")
+
+    ports_raw = os.getenv("ORCH_MONITOR_PORT_CANDIDATES", ",".join(str(p) for p in DEFAULT_MONITOR_PORTS))
+    ports = [int(x) for x in ports_raw.split(",") if x.strip().isdigit()]
+    if mpb_valid and ports:
+        port_results = []
+        for p in ports:
+            test_url = f"{mpb.rstrip('/')}:{p}/"
+            try:
+                with socket.create_connection((urlparse(mpb).hostname or "", p), timeout=2.0):
+                    port_results.append((p, True, ""))
+            except Exception as e:
+                port_results.append((p, False, str(e)))
+        any_ok = any(ok for _, ok, _ in port_results)
+        detail = "; ".join(f"{p}={'通' if ok else '不通('+err+')'}" for p, ok, err in port_results)
+        _check("端口公网可达", any_ok, detail, "请在安全组/防火墙放通这些端口" if not any_ok else "OK")
+    else:
+        _warn("端口公网可达", ports_raw, "需先修复 MONITOR_PUBLIC_BASE 才能测试端口连通性")
+
+    token = resolve_qgdata_token("")
+    token_ok = bool(token)
+    if token_ok:
+        try:
+            import qgdata as qg  # type: ignore
+            qg.set_token(token)
+            pro = qg.pro_api(timeout=5.0)
+            df = pro.stock_basic(exchange="", list_status="L", fields="ts_code", limit=1)
+            token_ok = df is not None and len(df) > 0
+            _check("QGDATA_TOKEN", token_ok, token[:6] + "***", "Token 校验通过" if token_ok else "Token 无效或接口无权限，请确认 Pro 套餐")
+        except Exception as e:
+            _check("QGDATA_TOKEN", False, token[:6] + "***", f"Token 校验异常: {e}")
+    else:
+        _check("QGDATA_TOKEN", False, "", "未配置，前往 https://quantgo.ai/data 获取")
+
+    ctrl = os.getenv("OPENCLAW_CONTROL_URL", "") or read_env_value_from_files("OPENCLAW_CONTROL_URL", [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env"])
+    if ctrl:
+        _warn("OPENCLAW_CONTROL_URL", ctrl, "已配置（用于自动推导 MONITOR_PUBLIC_BASE）")
+    else:
+        _warn("OPENCLAW_CONTROL_URL", "", "未配置（可选，可用于自动推导公网基址）")
+
+    rpb = os.getenv("REPORT_PUBLIC_BASE", "")
+    rpd = os.getenv("REPORT_PUBLIC_DIR", str(DEFAULT_REPORT_PUBLIC_DIR))
+    if rpb:
+        _warn("REPORT_PUBLIC_BASE", rpb, "已配置")
+    else:
+        _warn("REPORT_PUBLIC_BASE", "", "未配置（可选，用于持久化报告公网链接）")
+    rpd_ok = Path(rpd).is_dir() or not rpb
+    if rpb and not rpd_ok:
+        _check("REPORT_PUBLIC_DIR", False, rpd, "目录不存在，请创建或修正")
+    else:
+        _warn("REPORT_PUBLIC_DIR", rpd, "OK" if rpd_ok else "目录不存在")
+
+    env_file = PROJECT_ROOT / ".env"
+    if env_file.exists():
+        _warn(".env 文件", str(env_file), "已存在")
+    else:
+        example = PROJECT_ROOT.parent / ".env.example"
+        hint = f"不存在。建议: cp {example} {env_file} 然后编辑" if example.exists() else "不存在。建议创建 .env 文件配置环境变量"
+        _warn(".env 文件", str(env_file), hint)
+
+    print("\n" + "=" * 60)
+    print("  QuantClaw Config Doctor")
+    print("  https://gitee.com/GuojinQuant/quant-claw")
+    print("=" * 60)
+    for r in results:
+        icon = {"PASS": "✓", "FAIL": "✗", "WARN": "⚠"}[r["status"]]
+        print(f"\n  {icon} [{r['status']}] {r['check']}")
+        print(f"    值: {r['value']}")
+        print(f"    {r['hint']}")
+    print("\n" + "-" * 60)
+    if all_ok:
+        print("  所有必需项通过 ✓  可以正常运行")
+    else:
+        fail_count = sum(1 for r in results if r["status"] == "FAIL")
+        print(f"  {fail_count} 项未通过，请按提示修复后重新运行:")
+        print(f"  python3 {Path(__file__).name} config-doctor")
+        print(f"\n  详细配置指南: https://gitee.com/GuojinQuant/quant-claw#第四步配置环境变量")
+    print("=" * 60 + "\n")
+    return 0 if all_ok else 1
 
 
 def main() -> int:
@@ -647,6 +1126,8 @@ def main() -> int:
         return cmd_status(args)
     if args.cmd == "list":
         return cmd_list(args)
+    if args.cmd == "config-doctor":
+        return cmd_config_doctor(args)
     return 1
 
 

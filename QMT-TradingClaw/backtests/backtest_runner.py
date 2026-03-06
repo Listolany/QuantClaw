@@ -221,9 +221,10 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
     stage(3, total_stages, "running", f"回放完成 耗时{int(time.time()-t0)}s，统计中")
     df = engine.calculate_result()
     stats = engine.calculate_statistics(output=True)
-    _push_trades(engine)  # 推送交易记录到监控页
+    trade_list = _extract_trades(engine)
+    _push_trades(trade_list)
     stage(3, total_stages, "success", f"回测完成 收益={stats.get('total_return','N/A')} 夏普={stats.get('sharpe_ratio','N/A')}")
-    return df, stats
+    return df, stats, trade_list
 
 # ========== 指标输出 ==========
 def print_stats(stats, total_stages):
@@ -248,19 +249,19 @@ def print_stats(stats, total_stages):
 
 # ========== 推送精确净值到monitor ==========
 
-def _push_trades(engine):
-    """Push trade records to monitor page"""
-    if not MONITOR: return
+def _extract_trades(engine):
+    trades = list(getattr(engine, "trades", {}).values())
+    trade_list = []
+    for t in trades:
+        dt_str = t.datetime.strftime("%Y-%m-%d") if hasattr(t.datetime, "strftime") else str(t.datetime)[:10]
+        direction = "BUY" if t.direction == Direction.LONG else "SELL"
+        price, volume = float(t.price), float(t.volume)
+        trade_list.append({"date": dt_str, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}"})
+    return trade_list
+
+def _push_trades(trade_list):
+    if not MONITOR or not trade_list: return
     try:
-        trades = list(getattr(engine, "trades", {}).values())
-        if not trades: return
-        trade_list = []
-        for t in trades:
-            dt_str = t.datetime.strftime("%Y-%m-%d") if hasattr(t.datetime, "strftime") else str(t.datetime)[:10]
-            direction = "BUY" if t.direction == Direction.LONG else "SELL"
-            price = float(t.price)
-            volume = float(t.volume)
-            trade_list.append({"date": dt_str, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}"})
         _report_post("/api/trades", {"trades": trade_list})
         _report("/api/log", msg=f"Trades pushed ({len(trade_list)})")
     except Exception as e:
@@ -279,6 +280,19 @@ def _push_final_nav(df, total_stages):
         data["bench"] = [round(float(v), 6) for v in bnav_norm.values]
     _report_post("/api/final", data)
     _report("/api/log", msg="精确净值曲线已推送（含沪深300基准）")
+
+def _save_report_data(df, stats, trades, output_name):
+    if df is None or df.empty: return
+    nav = df["balance"].astype(float) / float(df["balance"].iloc[0])
+    bench = _load_hs300(nav.index.min(), nav.index.max())
+    data = {"dates": [d.strftime("%Y-%m-%d") for d in nav.index], "navs": [round(float(v), 6) for v in nav.values], "bench": [], "trades": trades or [],
+        "stats": {k: (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in (stats or {}).items()}}
+    if bench is not None and len(bench) > 10:
+        bnav = bench.reindex(nav.index).ffill().dropna().astype(float)
+        data["bench"] = [round(float(v), 6) for v in (bnav / float(bnav.iloc[0])).values]
+    path = os.path.join(BASE, f"{output_name}_report_data.json")
+    with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False)
+    p(f"[report_data] {path}")
 
 # ========== 净值曲线文件 ==========
 def plot_result(df, title, out_name, total_stages):
@@ -429,10 +443,11 @@ def main():
     try:
         validate_token(args.token, TOTAL)
         load_data(symbols_exchanges, interval, start, end, args.token, TOTAL)
-        df, stats = run_backtest(args.mode, strategy_cls, vt_symbols, interval, start, end,
+        df, stats, trade_list = run_backtest(args.mode, strategy_cls, vt_symbols, interval, start, end,
             args.capital, args.rate, args.slippage, args.size, args.pricetick, strategy_params, TOTAL)
         print_stats(stats, TOTAL)
-        _push_final_nav(df, TOTAL)  # 推送精确净值到monitor（替换实时估算）
+        _push_final_nav(df, TOTAL)
+        _save_report_data(df, stats, trade_list, args.output)
         plot_result(df, title, args.output, TOTAL)
     except Exception as e:
         import traceback; p(f"[failed] {type(e).__name__}: {e}"); p(traceback.format_exc()[-800:])

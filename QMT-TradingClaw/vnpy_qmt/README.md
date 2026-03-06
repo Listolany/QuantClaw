@@ -102,30 +102,92 @@ from .xt_datafeed import XtDatafeed as Datafeed
     * 资金账户：填写您在券商开户的资金账号
 4. 请注意以客户端方式连接时，需要保持迅投客户端的运行。
 
+## OpenClaw 回测报告公网持久化（新增）
+
+在 `pipeline_orchestrator.py submit` 中，除短时 `monitor_url` 外，现可同时产出长期 `report_url`（静态报告）。
+
+### 环境变量
+
+- `MONITOR_PUBLIC_BASE`：短时监控页公网基址（可选，优先级最高）
+- `OPENCLAW_CONTROL_URL`：OpenClaw 会话入口地址（可选；当 `MONITOR_PUBLIC_BASE` 为空时，系统会自动从该地址推导监控公网基址）
+- `REPORT_PUBLIC_BASE`：长期静态报告公网基址（例如 `http://8.211.147.124/reports`）
+- `REPORT_PUBLIC_DIR`：静态报告落盘目录（默认 `backtests/public_reports`，需由 Nginx/Caddy 映射到 `REPORT_PUBLIC_BASE`）
+
+推荐做法（开源友好）：
+
+- 不在代码里写死任何机器 IP/路径；
+- `cp .env.example QMT-TradingClaw/.env` 后填值即可，详见 [配置指南](https://gitee.com/GuojinQuant/quant-claw#第四步配置环境变量)；
+- 端口采用白名单策略（默认 `8767`），公网不可达时 submit 立即失败，不会"白跑"；
+- 一键诊断: `python3 backtests/pipeline_orchestrator.py config-doctor`。
+
+### 产出文件
+
+每次 run 结束后会发布（按 run_id 重命名）：
+
+- `{run_id}.html`：交互报告
+- `{run_id}_replay.html`：回放报告
+- `{run_id}_summary.json`：指标摘要
+- `{run_id}.png`：静态图（若生成）
+
+### 返回字段
+
+`submit` 返回和 `state.json` 中会包含：
+
+- `monitor_url`：短时监控链接
+- `report_url`：长期静态报告链接
+- `report_replay_url`：长期回放链接
+- `report_summary_url`：长期摘要链接
+
 ---
 
 ## OpenClaw量化策略助手
 
-本项目集成了OpenClaw Skill，实现**一句话生成策略 -> 自动回测 -> 自动调优 -> 自动实盘**的全流程。
+本项目集成了OpenClaw Skill，通过**三轮交互闭环**实现：需求确认 → LLM代码生成 → 自动回测 → 结果诊断/修复。
 
-### 功能概览
+### 三轮交互协议
 
-| 步骤 | 说明 |
-|------|------|
-| 需求解析 | 一句话描述策略意图，自动提取标的/周期/信号 |
-| 智能澄清 | 需求模糊时给出选项式问题 |
-| 策略生成 | 自动选择CTA(单标的)或Portfolio(多标的)框架 |
-| 自动回测 | 使用qgdata数据，生成净值曲线+核心指标 |
-| 结果展示 | 可点击曲线链接（交互版/回放版/PNG）+沪深300基准对比 |
-| 实盘运行 | 自动检测miniQMT，连接XtGateway运行策略 |
+| 轮次 | 触发 | 说明 |
+|------|------|------|
+| 第1轮：需求确认 | 用户描述回测需求 | 解析标的/周期/信号，确认参数，引导回复「开始生成」 |
+| 第2轮：代码生成+提交 | 用户回复「开始生成」 | LLM生成策略代码 → py_compile校验（最多3轮修复） → submit提交 → 返回monitor_url |
+| 第3轮：查看结果 | 用户回复「查看结果」 | 成功→摘要+report_url / 失败→按error_type分流修复 |
+
+### 外部策略文件支持（Shift-Left模式）
+
+`pipeline_orchestrator.py submit` 新增参数：
+
+```bash
+--strategy-file  "strategies/my_strategy.py"  # 预生成的策略文件（必须在strategies/目录内）
+--strategy-module "my_strategy"                # 模块名（默认从文件名推导）
+--strategy-class  "MyStrategy"                 # 类名（默认从文件自动检测）
+```
+
+- 策略文件路径安全校验：只允许 `strategies/` 目录内的 `.py` 文件
+- Worker启动时自动将策略文件快照到 `run_dir/strategy_snapshot.py`，保证复现性
+
+### 结构化错误报告
+
+Worker失败时保存结构化error到 `state.json`：
+
+| error_type | 含义 | Agent策略 |
+|-----------|------|----------|
+| `compile_error` | 编译失败 | 读代码+traceback → LLM修复 |
+| `runtime_error` | 运行时异常 | 读代码+traceback → LLM分析 |
+| `data_error` | 数据缺失/为空 | 提示检查标的/日期/token |
+| `config_error` | 配置问题 | 提示检查配置 |
+| `timeout_error` | 超时 | 建议缩短日期范围 |
+
+失败时也会生成最小 report HTML，确保 `report_url` 始终有内容。
+
+### 监控页错误面板
+
+运行时失败会在监控页顶部弹出醒目错误卡片，包含：错误类型、错误消息、可展开的堆栈详情、引导用户回对话页处理。
 
 ### 执行协议
 
-- **状态机**：每次执行携带唯一`run_id`，每阶段输出`[run_id][阶段N/总数][状态]`格式的进度
-- **心跳**：长时间任务每20-30秒自动汇报进度
 - **防重入**：通过`backtests/.run_lock`锁文件防止重复执行
 - **幂等重试**：自动修复最多3轮，超限交由用户决策
-- **失败快照**：错误时附带阶段+错误类型+最后20行日志
+- **失败快照**：结构化错误含error_type/traceback/step
 
 ### 实盘风控熔断
 

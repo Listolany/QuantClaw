@@ -57,7 +57,7 @@ quant-claw/
 - [ ] 已配置一个可用的 LLM API（OpenAI 兼容接口即可）
 - [ ] 已在 qgdata 平台开通 Pro 并拿到 `QGDATA_TOKEN`
 - [ ] 有一个可公网访问的 IP/域名（用于监控链接）
-- [ ] 安全组/防火墙放通监控端口（默认 `8761,8767`）
+- [ ] 安全组/防火墙放通监控白名单端口（默认 `8767`）
 - [ ] 若要模拟盘/实盘，已准备 Windows 环境（QMT 仅支持 Windows）
 
 ## 第一步：安装 Python 依赖
@@ -91,6 +91,24 @@ pip install -e QMT-TradingClaw/vnpy_qmt
 
 ## 第四步：配置环境变量
 
+仓库自带 `.env.example` 模板，**3 步搞定**：
+
+```bash
+# 1. 复制模板
+cp .env.example QMT-TradingClaw/.env
+
+# 2. 编辑填入你的值（至少填 QGDATA_TOKEN 和 MONITOR_PUBLIC_BASE）
+vim QMT-TradingClaw/.env
+
+# 3. 一键诊断，确认全部 PASS
+python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor
+```
+
+> `config-doctor` 会逐项检查 QMT_PROJECT_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。
+
+<details>
+<summary>如果不想用 .env 文件，也可以直接 export（点击展开）</summary>
+
 ### Linux/macOS
 
 ```bash
@@ -98,7 +116,7 @@ export QMT_PROJECT_ROOT="$(pwd)/QMT-TradingClaw"
 export PYTHON_BIN="python3"
 export QGDATA_TOKEN="你的qgdata_token"
 export MONITOR_PUBLIC_BASE="http://你的公网IP或域名"
-export ORCH_MONITOR_PORT_CANDIDATES="8761,8767"
+export ORCH_MONITOR_PORT_CANDIDATES="8767"
 ```
 
 ### Windows（PowerShell）
@@ -108,8 +126,10 @@ $env:QMT_PROJECT_ROOT = "$pwd\QMT-TradingClaw"
 $env:PYTHON_BIN = "python"
 $env:QGDATA_TOKEN = "你的qgdata_token"
 $env:MONITOR_PUBLIC_BASE = "http://你的公网IP或域名"
-$env:ORCH_MONITOR_PORT_CANDIDATES = "8761,8767"
+$env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 ```
+
+</details>
 
 ## 第五步：执行一次自动编排回测
 
@@ -126,7 +146,7 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8761,8767"
 "$PYTHON_BIN" "$QMT_PROJECT_ROOT/backtests/pipeline_orchestrator.py" submit \
   --requirement "海天味业，5日上穿10日金叉买入，死叉卖出" \
   --monitor-public-base "$MONITOR_PUBLIC_BASE" \
-  --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8761,8767}" \
+  --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8767}" \
   --timeout-sec 1200
 ```
 
@@ -149,8 +169,10 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8761,8767"
 
 ### 1）监控链接打不开
 
+- 运行 `python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor` 一键诊断。
 - 确认 `MONITOR_PUBLIC_BASE` 是公网地址，不是 `localhost`/`0.0.0.0`/内网 IP。
-- 确认安全组或防火墙放行 `ORCH_MONITOR_PORT_CANDIDATES` 配置的端口。
+- 确认安全组/防火墙放通白名单端口（默认 `8767`，通过 `ORCH_MONITOR_PORT_CANDIDATES` 配置）。
+- 端口采用白名单策略：只使用你显式声明的端口，公网不可达时 submit 会立即失败并提示原因，不会出现"回测成功但监控页打不开"的情况。
 
 ### 2）提示 token 无效或无权限
 
@@ -174,5 +196,6 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8761,8767"
 
 ## 安全建议
 
-- 不要把 `.env` 或 token 提交到仓库。
+- `.env` 已在 `.gitignore` 中，不会被提交；`.env.example` 不含真实密钥，可以提交。
 - 上云部署时，建议使用环境变量注入密钥，不要硬编码在脚本中。
+- 部署后运行 `config-doctor` 确认配置无误再使用。

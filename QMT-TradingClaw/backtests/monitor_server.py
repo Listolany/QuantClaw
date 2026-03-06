@@ -9,9 +9,9 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-STATE = {"run_id": "", "status": "waiting", "stage": "", "pct": 0, "dates": [], "points": [], 
-    "stats": {}, "logs": [], "done": False, "steps": {}, "requirement": {}, "code": "", 
-    "code_file": "", "final": None, "trades": None}
+STATE = {"run_id": "", "status": "waiting", "stage": "", "pct": 0, "dates": [], "points": [],
+    "stats": {}, "logs": [], "done": False, "steps": {}, "requirement": {}, "code": "",
+    "code_file": "", "final": None, "trades": None, "report_urls": {}, "error": None}
 LOCK = threading.Lock()
 CLIENTS = []
 
@@ -44,6 +44,27 @@ body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(1
 .pill-s{background:#dcfce7;color:#16a34a;border:1px solid #86efac}
 .pill-f{background:#fee2e2;color:#dc2626;border:1px solid #fca5a5}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.tl{display:flex;align-items:center;justify-content:center;padding:14px 32px;background:#fff;border-bottom:1px solid #e2e8f0;gap:0}
+.tl-s{display:flex;flex-direction:column;align-items:center;gap:4px;z-index:1}
+.tl-d{width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#94a3b8;transition:all .3s}
+.tl-d.run{background:#dbeafe;color:#2563eb;animation:pulse 1.5s infinite}
+.tl-d.ok{background:#dcfce7;color:#16a34a}
+.tl-d.err{background:#fee2e2;color:#dc2626}
+.tl-t{font-size:11px;color:#64748b;font-weight:600;white-space:nowrap}
+.tl-ln{flex:1;height:2px;background:#e2e8f0;min-width:48px;transition:background .3s}
+.tl-ln.ok{background:#86efac}
+.rpt-ban{display:none;padding:14px 32px;background:linear-gradient(90deg,#dcfce7,#d1fae5);border-bottom:1px solid #86efac;text-align:center;font-size:14px;font-weight:600;color:#166534}
+.rpt-ban a{color:#1e40af;text-decoration:underline;margin-left:12px;font-weight:700}
+.err-card{display:none;margin:0 auto 20px;max-width:1200px;padding:0 20px}
+.err-inner{background:linear-gradient(135deg,#fef2f2,#fff1f2);border:2px solid #fca5a5;border-radius:16px;padding:24px;box-shadow:0 4px 16px rgba(220,38,38,.1)}
+.err-inner h3{color:#dc2626;font-size:18px;font-weight:800;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.err-type{display:inline-block;background:#dc2626;color:#fff;font-size:11px;padding:3px 10px;border-radius:6px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.err-msg{color:#7f1d1d;font-size:14px;margin:12px 0;line-height:1.6}
+.err-tb{background:#1e1e1e;color:#f1f5f9;font-size:12px;padding:14px;border-radius:10px;max-height:200px;overflow:auto;font-family:'Cascadia Code','Fira Code',monospace;line-height:1.5;margin:12px 0;display:none}
+.err-toggle{background:none;border:1px solid #fca5a5;color:#dc2626;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600}
+.err-toggle:hover{background:#fee2e2}
+.err-guide{margin-top:16px;padding:14px;background:#fff;border-radius:10px;border:1px solid #e2e8f0;color:#475569;font-size:13px;line-height:1.6}
+.err-guide strong{color:#1e293b}
 .wrap{max-width:1200px;margin:0 auto;padding:24px 20px}
 .card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;margin-bottom:20px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 .card-h{padding:16px 20px;display:flex;align-items:center;gap:12px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
@@ -87,6 +108,23 @@ pre.code-block code{font-family:'Cascadia Code','Fira Code','Consolas',monospace
   <span class="rid" id="rid">-</span>
   <span class="pill pill-w" id="gpill">等待启动</span>
 </div>
+<div class="tl">
+  <div class="tl-s"><div class="tl-d" id="td1">1</div><div class="tl-t">需求确认</div></div>
+  <div class="tl-ln" id="tln1"></div>
+  <div class="tl-s"><div class="tl-d" id="td2">2</div><div class="tl-t">策略生成</div></div>
+  <div class="tl-ln" id="tln2"></div>
+  <div class="tl-s"><div class="tl-d" id="td3">3</div><div class="tl-t">回测执行</div></div>
+  <div class="tl-ln" id="tln3"></div>
+  <div class="tl-s"><div class="tl-d" id="td4">4</div><div class="tl-t">结果展示</div></div>
+</div>
+<div class="rpt-ban" id="rptBan">✅ 回测完成 <a id="rptLink" href="#" target="_blank">查看完整报告 →</a></div>
+<div class="err-card" id="errCard"><div class="err-inner">
+  <h3>⚠️ 执行失败 <span class="err-type" id="errType">ERROR</span></h3>
+  <div class="err-msg" id="errMsg"></div>
+  <button class="err-toggle" onclick="var t=document.getElementById('errTb');t.style.display=t.style.display==='none'?'block':'none'">展开详细堆栈</button>
+  <div class="err-tb" id="errTb"></div>
+  <div class="err-guide"><strong>如何处理？</strong><br>请回到对话页输入「查看结果」，AI 将为您诊断错误原因并尝试修复。<br>您也可以输入「重新生成」让 AI 重新生成策略代码。</div>
+</div></div>
 <div class="wrap">
   <div class="card" id="p1">
     <div class="card-h"><span class="title">📋 策略描述</span><span class="badge pill-w" id="b1">等待</span></div>
@@ -123,6 +161,14 @@ const RID=location.pathname.split('/').pop()||'';
 document.getElementById('rid').textContent='run: '+RID;
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function setBadge(id,st){const e=document.getElementById(id);if(!e)return;e.className='badge '+({running:'pill-r',success:'pill-s',failed:'pill-f'}[st]||'pill-w');e.textContent={pending:'等待',running:'进行中',success:'完成',failed:'失败'}[st]||st}
+function setTL(n,st){
+  const map={1:[1],2:[2],3:[2],4:[3],5:[4],9:[4]};
+  (map[n]||[]).forEach(d=>{const el=document.getElementById('td'+d);if(!el)return;
+    if(st==='running'){el.className='tl-d run'}
+    else if(st==='success'){el.className='tl-d ok';el.textContent='✓';const ln=document.getElementById('tln'+d);if(ln)ln.className='tl-ln ok'}
+    else if(st==='failed'){el.className='tl-d err';el.textContent='✗'}
+  })
+}
 function addLog(m){const e=document.getElementById('logs');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+m+'</div>';e.scrollTop=e.scrollHeight}
 const chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});
 const dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
@@ -150,7 +196,7 @@ function renderTrades(){
   const start=(currentPage-1)*pageSize,end=start+pageSize;
   const page=tradeData.slice(start,end);
   let h='<table class="trade-table"><thead><tr><th>日期</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr></thead><tbody>';
-  page.forEach(t=>{const cls=t.direction==='买入'?'buy':'sell';h+='<tr><td>'+t.date+'</td><td class="'+cls+'">'+t.direction+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td></tr>'});
+  page.forEach(t=>{const isBuy=t.direction==='买入'||t.direction==='BUY';const cls=isBuy?'buy':'sell';const dir=isBuy?'买入':'卖出';h+='<tr><td>'+t.date+'</td><td class="'+cls+'">'+dir+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td></tr>'});
   h+='</tbody></table>';document.getElementById('c6').innerHTML=h||'<div class="empty">暂无交易记录</div>';
   const total=Math.ceil(tradeData.length/pageSize);
   const nav=document.getElementById('pageNav');
@@ -159,7 +205,7 @@ function renderTrades(){
 }
 const es=new EventSource('/api/sse?run_id='+RID);
 es.addEventListener('step',e=>{const d=JSON.parse(e.data);addLog('['+d.step+'] '+d.title+': '+(d.msg||d.status));
-  const sn=parseInt(d.step)||0;
+  const sn=parseInt(d.step)||0;setTL(sn,d.status);
   if(sn<=2){setBadge('b1',d.status);if(d.status==='running'){const g=document.getElementById('gpill');g.className='pill pill-r';g.textContent='执行中'}}
   if(sn===3||d.step.includes('3')){setBadge('b2',d.status)}
   if(sn>=4){setBadge('b3',d.status)}
@@ -188,7 +234,6 @@ es.addEventListener('point',e=>{const d=JSON.parse(e.data);
 es.addEventListener('final_chart',e=>{const d=JSON.parse(e.data);
   chartOpt.xAxis.data=d.dates;chartOpt.series[0].data=d.navs;chartOpt.series[1].data=d.bench||[];
   chart.setOption(chartOpt,true);setBadge('b3','success');document.getElementById('bar3').style.width='100%';
-  // 计算每日收益（确保索引对齐）
   const daily=[];const dailyDates=[];
   for(let i=1;i<d.navs.length&&i<d.dates.length;i++){
     const prev=d.navs[i-1]||1,curr=d.navs[i];
@@ -201,14 +246,23 @@ es.addEventListener('stats',e=>{const d=JSON.parse(e.data);setBadge('b5','succes
   const el=document.getElementById('c5');el.classList.remove('empty');
   const fmt={total_return:['总收益率',true],annual_return:['年化收益',true],max_ddpercent:['最大回撤',true],sharpe_ratio:['夏普比率',true],total_trade_count:['交易次数',false],total_days:['交易天数',false],profit_days:['盈利天数',false],loss_days:['亏损天数',false]};
   let h='<div class="stats-grid">';for(const[k,[lb,isPct]] of Object.entries(fmt)){const v=d[k];if(v===undefined)continue;
-    const n=typeof v==='number';let disp=n?(isPct?(v*100).toFixed(2)+'%':v.toFixed(4)):v;
+    const n=typeof v==='number';let disp=n?(isPct?v.toFixed(2)+'%':v.toFixed(4)):v;
     const c=n?(v>=0?'pos':'neg'):'neu';
     h+='<div class="sc"><div class="lb">'+lb+'</div><div class="vl '+c+'">'+disp+'</div></div>'}
   el.innerHTML=h+'</div>'});
 es.addEventListener('trades',e=>{const d=JSON.parse(e.data);tradeData=d.trades||[];currentPage=1;renderTrades()});
 es.addEventListener('log',e=>{const d=JSON.parse(e.data);addLog(d.msg||'')});
 es.addEventListener('done',e=>{const g=document.getElementById('gpill');g.className='pill pill-s';g.textContent='已完成';
-  setBadge('b3','success');setBadge('b5','success');addLog('✅ 全部完成')});
+  setBadge('b3','success');setBadge('b5','success');setTL(5,'success');addLog('✅ 全部完成')});
+es.addEventListener('report_urls',e=>{const d=JSON.parse(e.data);const url=d.report_url||'';
+  if(url){document.getElementById('rptLink').href=url;document.getElementById('rptBan').style.display='block'}});
+es.addEventListener('error_info',e=>{const d=JSON.parse(e.data);
+  document.getElementById('errCard').style.display='block';
+  document.getElementById('errType').textContent=(d.error_type||'ERROR').toUpperCase();
+  document.getElementById('errMsg').textContent=(d.step?'['+d.step+'] ':'')+d.message;
+  if(d.traceback){document.getElementById('errTb').textContent=d.traceback}
+  const g=document.getElementById('gpill');g.className='pill pill-f';g.textContent='失败';
+  addLog('❌ '+d.error_type+': '+d.message)});
 es.onerror=()=>{addLog('⚠️ 连接断开，自动重连...')};
 </script></body></html>"""
 
@@ -233,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
             if s.get("final"): self._sse_send("final_chart", s["final"])
             if s.get("stats"): self._sse_send("stats", s["stats"])
             if s.get("trades") is not None: self._sse_send("trades", {"trades": s["trades"]})
+            if s.get("report_urls"): self._sse_send("report_urls", s["report_urls"])
+            if s.get("error"): self._sse_send("error_info", s["error"])
             for st in s.get("steps", {}).values(): self._sse_send("step", st)
             if s.get("done"): self._sse_send("done", {})
             self.wfile.flush()
@@ -307,6 +363,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json_ok()
             with LOCK: STATE["trades"] = data.get("trades", [])
             broadcast("trades", data)
+        elif path == "/api/report_urls":
+            self._json_ok()
+            with LOCK: STATE["report_urls"] = data
+            broadcast("report_urls", data)
+        elif path == "/api/error":
+            self._json_ok()
+            with LOCK: STATE["error"] = data
+            broadcast("error_info", data)
         else:
             self.send_response(404); self.end_headers()
     def _json_ok(self):
