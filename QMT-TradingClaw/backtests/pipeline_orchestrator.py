@@ -741,6 +741,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         state_["errors"].append({"at": now_iso(), "error_type": error_type, "step": step, "message": message, "traceback": tb[:4000]})
         store.save(state_)
         monitor_post(monitor_base, "/api/error", {"error_type": error_type, "step": step, "message": message, "traceback": tb[:2000]})
+        monitor_get(monitor_base, f"/api/log?{urlencode({'msg': f'[{error_type}] {step}: {message}'})}", timeout=2.0)
 
     def _fail_report(state_: Dict, error_msg: str) -> None:
         """失败时也生成最小 report HTML"""
@@ -934,9 +935,10 @@ def cmd_worker(args: argparse.Namespace) -> int:
         store.save(state)
         return 1
     finally:
-        monitor_post(monitor_base, "/api/done", {})
+        done_ok = monitor_post(monitor_base, "/api/done", {})
         mon_pid = state.get("process", {}).get("monitor_pid")
-        if mon_pid:
+        # done 回调成功时保留短窗口供用户查看失败日志；仅在回调失败时兜底强杀，防泄漏。
+        if mon_pid and not done_ok:
             try: os.kill(mon_pid, 15)
             except OSError: pass
 

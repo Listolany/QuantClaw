@@ -268,6 +268,9 @@ es.onerror=()=>{addLog('⚠️ 连接断开，自动重连...')};
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+    def _mark_done(self):
+        with LOCK: STATE["done"] = True; STATE["status"] = "done"; STATE["pct"] = 100
+        broadcast("done", {}); broadcast("progress", STATE)
     def do_GET(self):
         path = urlparse(self.path).path; qs = parse_qs(urlparse(self.path).query)
         if path == "/" or path.startswith("/runs/"):
@@ -332,8 +335,7 @@ class Handler(BaseHTTPRequestHandler):
             broadcast("log", {"msg": msg})
         elif path == "/api/done":
             self._json_ok()
-            with LOCK: STATE["done"] = True; STATE["status"] = "done"; STATE["pct"] = 100
-            broadcast("done", {}); broadcast("progress", STATE)
+            self._mark_done()
         elif path == "/api/health":
             self._json_ok()
         else:
@@ -371,6 +373,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json_ok()
             with LOCK: STATE["error"] = data
             broadcast("error_info", data)
+        elif path == "/api/done":
+            self._json_ok()
+            self._mark_done()
         else:
             self.send_response(404); self.end_headers()
     def _json_ok(self):
@@ -403,6 +408,7 @@ def _kill_port(port):
     print(f"[warn] 端口 {port} 清理 3 次仍被占用", flush=True)
 
 MONITOR_MAX_IDLE_SEC = int(os.environ.get("MONITOR_MAX_IDLE_SEC", "1800"))  # 30min 兜底自杀
+MONITOR_DONE_KEEPALIVE_SEC = int(os.environ.get("MONITOR_DONE_KEEPALIVE_SEC", "90"))  # done后保留窗口
 
 
 def main():
@@ -424,7 +430,7 @@ def main():
                 print(f"[monitor] idle timeout ({MONITOR_MAX_IDLE_SEC}s), shutting down", flush=True)
                 break
             time.sleep(2)
-        time.sleep(5 if not STATE["done"] else 300)
+        time.sleep(MONITOR_DONE_KEEPALIVE_SEC if STATE["done"] else 5)
         srv.shutdown()
     threading.Thread(target=auto_stop, daemon=True).start()
     try: srv.serve_forever()
