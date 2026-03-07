@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import ipaddress
 import json
 import os
@@ -13,7 +14,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.error import URLError
@@ -22,7 +23,7 @@ from urllib.request import Request, urlopen
 
 from data_capability_guard import evaluate_requirement
 
-PROJECT_ROOT = Path(os.getenv("QMT_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+PROJECT_ROOT = Path(os.getenv("QUANTCLAW_ROOT", "") or os.getenv("QMT_PROJECT_ROOT", "") or str(Path(__file__).resolve().parents[1])).resolve()
 BACKTESTS_DIR = PROJECT_ROOT / "backtests"
 STRATEGIES_DIR = PROJECT_ROOT / "strategies"
 RUNS_DIR = BACKTESTS_DIR / "orchestrator_runs"
@@ -180,33 +181,78 @@ def resolve_symbols_by_name(requirement: str, token: str) -> list[str]:
         return []
 
 
+def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 50) -> list[str]:
+    """解析股票池关键词→实际代码列表（全市场取主板+创业板活跃标的，控制数量避免回测过慢）"""
+    pool_kw = {"全市场": "", "沪深主板": "主板", "创业板": "创业板", "科创板": "科创板", "沪深300": "主板", "中证500": "主板"}
+    matched = ""
+    for kw, market_filter in pool_kw.items():
+        if kw in txt:
+            matched = kw; break
+    if not matched:
+        return []
+    try:
+        import qgdata as qg
+        if token: qg.set_token(token)
+        pro = qg.pro_api(timeout=10)
+        fields = "ts_code,name,market"
+        df = pro.stock_basic(exchange="", list_status="L", fields=fields)
+        if df is None or len(df) == 0:
+            return []
+        if matched == "科创板":
+            df = df[df["market"] == "科创板"]
+        elif matched == "创业板":
+            df = df[df["market"] == "创业板"]
+        elif matched in ("全市场", "沪深300", "中证500", "沪深主板"):
+            df = df[df["market"].isin(["主板", "创业板"])]
+        codes = [normalize_symbol(str(r["ts_code"])) for _, r in df.iterrows()]
+        if len(codes) > max_stocks:
+            import random; random.seed(42); codes = random.sample(codes, max_stocks)
+        return codes
+    except Exception:
+        return []
+
+
 def parse_requirement(requirement: str, symbols_override: Optional[str], token: str = "") -> Dict[str, Any]:
     txt = requirement.strip()
-    symbol_matches = re.findall(r"\b(\d{6}\.(?:SZSE|SSE|SZ|SH|SS)|\d{6})\b", txt, flags=re.IGNORECASE)
+    symbol_matches = re.findall(r"(?<!\d)(\d{6}\.(?:SZSE|SSE|SZ|SH|SS)|\d{6})(?!\d)", txt, flags=re.IGNORECASE)
     symbols = [normalize_symbol(s) for s in symbol_matches]
     if symbols_override:
         symbols = [normalize_symbol(s) for s in symbols_override.split(",") if s.strip()]
     if not symbols:
-        symbols = resolve_symbols_by_name(txt, token) or ["000001.SZSE"]
+        symbols = resolve_symbols_by_name(txt, token)
+    if not symbols:
+        pool = _resolve_stock_pool(txt, token)
+        symbols = pool if pool else ["000001.SZSE"]
 
-    windows = [int(m.group(1)) for m in re.finditer(r"(\d+)\s*日", txt)]
-    if len(windows) >= 2:
-        fast_window, slow_window = sorted(windows[:2])
-    elif len(windows) == 1:
-        fast_window, slow_window = max(5, windows[0] // 2), windows[0]
+    ma_kw = ["均线", "上穿", "下穿", "金叉", "死叉", "SMA", "sma", "EMA", "ema", "日线交叉", "移动平均"]
+    is_ma = any(k in txt for k in ma_kw) or bool(re.search(r'\bMA\b(?!CD)', txt))
+    result: Dict[str, Any] = {"symbols": symbols}
+    if is_ma:
+        windows = [int(m.group(1)) for m in re.finditer(r"(\d+)\s*日", txt)]
+        if len(windows) >= 2:
+            result["fast_window"], result["slow_window"] = sorted(windows[:2])
+        elif len(windows) == 1:
+            result["fast_window"], result["slow_window"] = max(5, windows[0] // 2), windows[0]
+        else:
+            result["fast_window"], result["slow_window"] = 5, 10
+
+    min_match = re.search(r"(\d+)\s*分钟|(\d+)\s*min", txt, re.IGNORECASE)
+    if any(k in txt for k in ["60分钟", "小时", "hour", "1h", "60min"]):
+        interval = "HOUR"
+    elif min_match:
+        mins = int(min_match.group(1) or min_match.group(2))
+        interval = {5: "5MIN", 15: "15MIN", 30: "30MIN", 1: "MINUTE"}.get(mins, "5MIN")
+    elif "分钟" in txt:
+        interval = "5MIN"
+    elif "周" in txt and any(k in txt for k in ["周线", "周级别", "每周", "周K"]):
+        interval = "WEEKLY"
     else:
-        fast_window, slow_window = 5, 10
-
-    interval = "MINUTE" if ("分钟" in txt or "min" in txt.lower()) else "DAILY"
+        interval = "DAILY"
     direction = "bearish" if any(k in txt for k in ["下穿", "死叉"]) else "bullish"
-
-    return {
-        "symbols": symbols,
-        "fast_window": fast_window,
-        "slow_window": slow_window,
-        "interval": interval,
-        "direction": direction,
-    }
+    multi_kw = ["轮动", "选股", "组合", "多标的", "portfolio", "多只", "排列", "全市场"]
+    mode = "portfolio" if (len(symbols) > 1 or any(k in txt for k in multi_kw)) else "cta"
+    result.update({"interval": interval, "direction": direction, "mode": mode})
+    return result
 
 
 DEFAULT_MONITOR_PORTS = [8767]  # 白名单端口，必须在防火墙/安全组中放通
@@ -463,8 +509,8 @@ window.addEventListener('resize',()=>{{ch.resize();dc.resize()}})
 let pg=1;const ps=15;
 function render(){{
 const s=(pg-1)*ps,page=T.slice(s,s+ps);
-let h='<table class="tt"><thead><tr><th>日期</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr></thead><tbody>';
-page.forEach(t=>{{const ib=t.direction==='买入'||t.direction==='BUY';h+='<tr><td>'+t.date+'</td><td class="'+(ib?'buy':'sell')+'">'+(ib?'买入':'卖出')+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td></tr>'}});
+let h='<table class="tt"><thead><tr><th>日期</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>盈亏</th></tr></thead><tbody>';
+page.forEach(t=>{{const ib=t.direction==='买入'||t.direction==='BUY';const pnl=t.pnl||'';const ps=pnl?(parseFloat(pnl)>=0?'color:#16a34a;font-weight:600':'color:#dc2626;font-weight:600'):'';const sym=t.symbol||'';h+='<tr><td>'+t.date+'</td><td>'+sym+'</td><td class="'+(ib?'buy':'sell')+'">'+(ib?'买入':'卖出')+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td><td style="'+ps+'">'+pnl+'</td></tr>'}});
 h+='</tbody></table>';document.getElementById('tradeArea').innerHTML=h||'<div style="color:#94a3b8;text-align:center;padding:40px">暂无交易记录</div>';
 const tp=Math.ceil(T.length/ps),nav=document.getElementById('tradeNav');
 if(tp>1){{let p='';for(let i=1;i<=tp;i++)p+='<button class="'+(i===pg?'act':'')+'" onclick="window._tp('+i+')">'+i+'</button>';nav.innerHTML=p}}else nav.innerHTML=''}}
@@ -532,8 +578,167 @@ def start_process(command: list[str], log_path: Path, env: Optional[Dict[str, st
     )
 
 
+def _lot_size_for_symbol(code: str) -> int:
+    """根据A股代码确定最小交易单位：科创板688xxx→200股，其余→100股"""
+    digits = "".join(c for c in code if c.isdigit())[:6]
+    return 200 if digits.startswith("688") else 100
+
+
 def strategy_source(class_name: str, fast: int, slow: int, author: str, direction: str) -> str:
-    return f'''"""Auto-generated MA cross strategy."""\nfrom vnpy_ctastrategy import CtaTemplate\nfrom vnpy_ctastrategy.base import StopOrder\nfrom vnpy.trader.object import BarData, TradeData, OrderData\nfrom vnpy.trader.utility import ArrayManager\n\n\nclass {class_name}(CtaTemplate):\n    author = "{author}"\n    fast_window = {fast}\n    slow_window = {slow}\n    fixed_size = 100\n    direction_hint = "{direction}"\n\n    parameters = ["fast_window", "slow_window", "fixed_size", "direction_hint"]\n    variables = ["fast_ma", "slow_ma"]\n\n    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):\n        super().__init__(cta_engine, strategy_name, vt_symbol, setting)\n        self.am = ArrayManager(size=self.slow_window + 5)\n        self.fast_ma = 0.0\n        self.slow_ma = 0.0\n        self.prev_fast = 0.0\n        self.prev_slow = 0.0\n\n    def on_init(self):\n        self.load_bar(self.slow_window + 20)\n\n    def on_start(self):\n        pass\n\n    def on_stop(self):\n        pass\n\n    def on_bar(self, bar: BarData):\n        self.am.update_bar(bar)\n        if not self.am.inited:\n            return\n\n        self.cancel_all()\n        self.prev_fast = self.fast_ma\n        self.prev_slow = self.slow_ma\n        self.fast_ma = self.am.sma(self.fast_window)\n        self.slow_ma = self.am.sma(self.slow_window)\n\n        cross_up = self.prev_fast <= self.prev_slow and self.fast_ma > self.slow_ma\n        cross_down = self.prev_fast >= self.prev_slow and self.fast_ma < self.slow_ma\n\n        if self.pos == 0 and cross_up:\n            # Use aggressive limit to emulate next-bar open fill in backtesting.\n            self.buy(bar.close_price * 1.10, self.fixed_size)\n        elif self.pos > 0 and cross_down:\n            # Use aggressive limit to emulate next-bar open fill in backtesting.\n            self.sell(bar.close_price * 0.90, abs(self.pos))\n\n        self.put_event()\n\n    def on_trade(self, trade: TradeData):\n        self.put_event()\n\n    def on_order(self, order: OrderData):\n        pass\n\n    def on_stop_order(self, stop_order: StopOrder):\n        pass\n'''
+    return f'''"""Auto-generated MA cross strategy — 动态全仓 + 交易所合规手数"""
+from vnpy_ctastrategy import CtaTemplate
+from vnpy_ctastrategy.base import StopOrder
+from vnpy.trader.object import BarData, TradeData, OrderData
+from vnpy.trader.utility import ArrayManager
+
+
+def _calc_volume(symbol: str, price: float, capital: float) -> int:
+    """按资金全仓计算合规手数：主板/创业板100股整数倍，科创板(688)200起+1股递增"""
+    digits = "".join(c for c in symbol if c.isdigit())[:6]
+    if digits.startswith("688"):
+        vol = int(capital / price)
+        return max(vol, 200) if vol >= 200 else 0
+    else:
+        vol = int(capital / price / 100) * 100
+        return max(vol, 100) if vol >= 100 else 0
+
+
+class {class_name}(CtaTemplate):
+    author = "{author}"
+    fast_window = {fast}
+    slow_window = {slow}
+    capital = 1000000.0
+    direction_hint = "{direction}"
+
+    parameters = ["fast_window", "slow_window", "capital", "direction_hint"]
+    variables = ["fast_ma", "slow_ma"]
+
+    def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
+        super().__init__(cta_engine, strategy_name, vt_symbol, setting)
+        self.am = ArrayManager(size=self.slow_window + 5)
+        self.fast_ma = 0.0
+        self.slow_ma = 0.0
+        self.prev_fast = 0.0
+        self.prev_slow = 0.0
+
+    def on_init(self):
+        self.load_bar(self.slow_window + 20)
+
+    def on_start(self):
+        pass
+
+    def on_stop(self):
+        pass
+
+    def on_bar(self, bar: BarData):
+        self.am.update_bar(bar)
+        if not self.am.inited:
+            return
+
+        self.cancel_all()
+        self.prev_fast = self.fast_ma
+        self.prev_slow = self.slow_ma
+        self.fast_ma = self.am.sma(self.fast_window)
+        self.slow_ma = self.am.sma(self.slow_window)
+
+        cross_up = self.prev_fast <= self.prev_slow and self.fast_ma > self.slow_ma
+        cross_down = self.prev_fast >= self.prev_slow and self.fast_ma < self.slow_ma
+
+        if self.pos == 0 and cross_up:
+            vol = _calc_volume(self.vt_symbol, bar.close_price, self.capital)
+            self.buy(bar.close_price * 1.31, vol)
+        elif self.pos > 0 and cross_down:
+            self.sell(bar.close_price * 0.69, abs(self.pos))
+
+        self.put_event()
+
+    def on_trade(self, trade: TradeData):
+        self.put_event()
+
+    def on_order(self, order: OrderData):
+        pass
+
+    def on_stop_order(self, stop_order: StopOrder):
+        pass
+'''
+
+
+def portfolio_strategy_source(class_name: str, fast: int, slow: int, author: str, direction: str, vt_symbols: list[str]) -> str:
+    syms_str = json.dumps(vt_symbols)
+    return f'''"""Auto-generated Portfolio MA cross strategy — 多标的组合 + 动态全仓 + 交易所合规手数"""
+from vnpy_portfoliostrategy import StrategyTemplate
+from vnpy.trader.object import BarData
+from vnpy.trader.utility import ArrayManager
+
+
+def _calc_volume(symbol: str, price: float, capital: float) -> int:
+    """按资金动态计算合规手数：主板/创业板100股整数倍，科创板(688)200起+1股递增"""
+    digits = "".join(c for c in symbol if c.isdigit())[:6]
+    if digits.startswith("688"):
+        vol = int(capital / price)
+        return max(vol, 200) if vol >= 200 else 0
+    else:
+        vol = int(capital / price / 100) * 100
+        return max(vol, 100) if vol >= 100 else 0
+
+
+class {class_name}(StrategyTemplate):
+    author = "{author}"
+    fast_window = {fast}
+    slow_window = {slow}
+    capital = 1000000.0
+    direction_hint = "{direction}"
+
+    parameters = ["fast_window", "slow_window", "capital", "direction_hint"]
+    variables = []
+
+    def __init__(self, strategy_engine, strategy_name, vt_symbols, setting):
+        super().__init__(strategy_engine, strategy_name, vt_symbols, setting)
+        self.vt_symbols = {syms_str}
+        self.ams: dict[str, ArrayManager] = {{s: ArrayManager(size=self.slow_window + 5) for s in self.vt_symbols}}
+        self.prev_fast: dict[str, float] = {{s: 0.0 for s in self.vt_symbols}}
+        self.prev_slow: dict[str, float] = {{s: 0.0 for s in self.vt_symbols}}
+
+    def on_init(self):
+        self.load_bars(self.slow_window + 20)
+
+    def on_start(self):
+        pass
+
+    def on_stop(self):
+        pass
+
+    def on_bars(self, bars: dict[str, BarData]):
+        per_capital = self.capital / max(len(self.vt_symbols), 1)
+        for vt_symbol in self.vt_symbols:
+            bar = bars.get(vt_symbol)
+            if not bar:
+                continue
+            am = self.ams[vt_symbol]
+            am.update_bar(bar)
+            if not am.inited:
+                continue
+
+            prev_f = self.prev_fast.get(vt_symbol, 0.0)
+            prev_s = self.prev_slow.get(vt_symbol, 0.0)
+            fast_ma = am.sma(self.fast_window)
+            slow_ma = am.sma(self.slow_window)
+            self.prev_fast[vt_symbol] = fast_ma
+            self.prev_slow[vt_symbol] = slow_ma
+
+            cross_up = prev_f <= prev_s and fast_ma > slow_ma
+            cross_down = prev_f >= prev_s and fast_ma < slow_ma
+
+            pos = self.get_pos(vt_symbol)
+            if pos == 0 and cross_up:
+                vol = _calc_volume(vt_symbol, bar.close_price, per_capital)
+                if vol > 0:
+                    self.buy(vt_symbol, bar.close_price * 1.31, vol)
+            elif pos > 0 and cross_down:
+                self.sell(vt_symbol, bar.close_price * 0.69, abs(pos))
+
+        self.put_event()
+'''
 
 
 def wait_monitor_ready(base_url: str, timeout_sec: int = 20) -> bool:
@@ -783,11 +988,16 @@ def cmd_worker(args: argparse.Namespace) -> int:
             state["status"] = "code_ready"
             store.mark_step(state, "strategy_generation", "success", f"external: {strategy_file_path.name}")
         else:
-            monitor_step(monitor_base, step="2", status="running", title="策略生成", msg="正在生成策略代码", run_id=run_id)
+            bt_mode = parsed.get("mode", "cta")
+            monitor_step(monitor_base, step="2", status="running", title="策略生成", msg=f"正在生成{bt_mode.upper()}策略代码", run_id=run_id)
             module_name = f"auto_ma_{run_id}".lower()
-            class_name = "AutoMaCrossStrategy"
+            class_name = "AutoMaCrossStrategy" if bt_mode == "cta" else "AutoPortfolioStrategy"
             strategy_file_path = STRATEGIES_DIR / f"{module_name}.py"
-            source = strategy_source(class_name, parsed["fast_window"], parsed["slow_window"], "quant-strategy-assistant", parsed["direction"])
+            fw, sw = parsed.get("fast_window", 5), parsed.get("slow_window", 10)
+            if bt_mode == "portfolio":
+                source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"], [normalize_symbol(s) for s in parsed["symbols"]])
+            else:
+                source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"])
             strategy_file_path.write_text(source, encoding="utf-8")
             subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
             monitor_post(monitor_base, "/api/code", {"filename": strategy_file_path.name, "content": source})
@@ -807,7 +1017,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             "--symbols",
             ",".join(parsed["symbols"]),
             "--mode",
-            "cta",
+            parsed.get("mode", "cta"),
             "--interval",
             payload["interval"],
             "--capital",
@@ -839,7 +1049,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             cmd.extend(["--token", qgdata_token])
 
         run_log_path = store.run_dir / "backtest.log"
-        proc = start_process(cmd, run_log_path, env={**os.environ, "QMT_PROJECT_ROOT": str(PROJECT_ROOT)})
+        proc = start_process(cmd, run_log_path, env={**os.environ, "QUANTCLAW_ROOT": str(PROJECT_ROOT), "QMT_PROJECT_ROOT": str(PROJECT_ROOT)})
         state["process"]["backtest_pid"] = proc.pid
         store.save(state)
 
@@ -993,7 +1203,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--start", default="")
     submit.add_argument("--end", default="")
     submit.add_argument("--interval", default="")
-    submit.add_argument("--capital", type=float, default=100000)
+    submit.add_argument("--capital", type=float, default=1000000)
     submit.add_argument("--rate", type=float, default=0.0003)
     submit.add_argument("--slippage", type=float, default=0.01)
     submit.add_argument("--size", type=float, default=1)
@@ -1014,6 +1224,24 @@ def build_parser() -> argparse.ArgumentParser:
     ls_cmd.add_argument("--limit", type=int, default=20)
 
     sub.add_parser("config-doctor", help="一键诊断所有必需配置项")
+    sub.add_parser("qmt-check", help="检测 QMT 模拟/实盘环境可用性")
+
+    opt = sub.add_parser("optimize", help="参数优化（穷举/遗传算法）")
+    opt.add_argument("--strategy-file", required=True, help="策略文件路径")
+    opt.add_argument("--strategy-class", required=True, help="策略类名")
+    opt.add_argument("--symbols", required=True, help="标的代码（如 600519.SSE）")
+    opt.add_argument("--optimize-params", required=True, help='优化参数JSON: {"target":"sharpe_ratio","params":{"fast_window":[5,30,5]}}')
+    _d_end = datetime.now().strftime("%Y%m%d")
+    _d_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+    opt.add_argument("--start", default=_d_start)
+    opt.add_argument("--end", default=_d_end)
+    opt.add_argument("--interval", default="DAILY")
+    opt.add_argument("--capital", type=float, default=1000000)
+    opt.add_argument("--rate", type=float, default=0.0003)
+    opt.add_argument("--slippage", type=float, default=0.01)
+    opt.add_argument("--size", type=float, default=1)
+    opt.add_argument("--pricetick", type=float, default=0.01)
+    opt.add_argument("--top-n", type=int, default=10, help="返回前N组最优参数")
 
     return parser
 
@@ -1033,9 +1261,9 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
     def _warn(name: str, val: str, hint: str):
         results.append({"check": name, "status": "WARN", "value": val or "(空)", "hint": hint})
 
-    root = os.getenv("QMT_PROJECT_ROOT", "")
+    root = os.getenv("QUANTCLAW_ROOT", "") or os.getenv("QMT_PROJECT_ROOT", "")
     root_ok = bool(root) and Path(root).is_dir() and (Path(root) / "backtests" / "pipeline_orchestrator.py").exists()
-    _check("QMT_PROJECT_ROOT", root_ok, root, "项目根目录，应包含 backtests/pipeline_orchestrator.py" if not root_ok else "OK")
+    _check("QUANTCLAW_ROOT", root_ok, root, "项目根目录，应包含 backtests/pipeline_orchestrator.py（也接受 QMT_PROJECT_ROOT）" if not root_ok else "OK")
 
     py = os.getenv("PYTHON_BIN", "") or DEFAULT_PYTHON_BIN
     py_ok = shutil.which(py) is not None
@@ -1124,6 +1352,123 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_optimize(args: argparse.Namespace) -> int:
+    """参数优化：穷举遍历参数组合，返回最优参数集（JSON）"""
+    strategy_file = Path(args.strategy_file).resolve()
+    if not strategy_file.exists():
+        print(json.dumps({"status": "error", "error": f"策略文件不存在: {strategy_file}"}, ensure_ascii=False))
+        return 1
+    try:
+        opt_cfg = json.loads(args.optimize_params)
+    except json.JSONDecodeError as e:
+        print(json.dumps({"status": "error", "error": f"optimize-params JSON 解析失败: {e}"}, ensure_ascii=False))
+        return 1
+    target = opt_cfg.get("target", "sharpe_ratio")
+    param_ranges = opt_cfg.get("params", {})
+    if not param_ranges:
+        print(json.dumps({"status": "error", "error": "params 为空，需指定至少一个参数范围 {\"name\": [start, end, step]}"}, ensure_ascii=False))
+        return 1
+    vnpy_qmt_path = PROJECT_ROOT / "vnpy_qmt"
+    for p in [str(vnpy_qmt_path), str(STRATEGIES_DIR), str(strategy_file.parent)]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    try:
+        import importlib
+        mod = importlib.import_module(strategy_file.stem)
+        cls_name = args.strategy_class
+        if not hasattr(mod, cls_name):
+            low = cls_name.lower()
+            hit = [n for n in dir(mod) if n.lower() == low]
+            cls_name = hit[0] if hit else cls_name
+        strategy_cls = getattr(mod, cls_name)
+    except Exception as e:
+        print(json.dumps({"status": "error", "error": f"策略导入失败: {e}"}, ensure_ascii=False))
+        return 1
+    try:
+        from vnpy_ctastrategy.backtesting import BacktestingEngine
+        from vnpy.trader.optimize import OptimizationSetting
+        from vnpy.trader.constant import Interval
+        from vnpy.trader.setting import SETTINGS
+        qgdata_token = os.getenv("QGDATA_TOKEN", "") or resolve_qgdata_token("")
+        if qgdata_token:
+            SETTINGS["datafeed.name"] = "qg"
+            SETTINGS["datafeed.password"] = qgdata_token
+        vt_symbol = args.symbols.split(",")[0].strip()
+        interval = getattr(Interval, args.interval)
+        start_dt = datetime.strptime(args.start, "%Y%m%d")
+        end_dt = datetime.strptime(args.end, "%Y%m%d")
+        engine = BacktestingEngine()
+        engine.set_parameters(vt_symbol=vt_symbol, interval=interval, start=start_dt, end=end_dt,
+            rate=args.rate, slippage=args.slippage, size=args.size, pricetick=args.pricetick, capital=args.capital)
+        engine.add_strategy(strategy_cls, {})
+        engine.load_data()
+        bar_count = len(getattr(engine, "history_data", []) or [])
+        if bar_count == 0:
+            print(json.dumps({"status": "error", "error": "数据库无缓存数据，请先运行一次回测以下载并缓存行情数据"}, ensure_ascii=False))
+            return 1
+        setting = OptimizationSetting()
+        setting.set_target(target)
+        for name, rng in param_ranges.items():
+            setting.add_parameter(name, rng[0], rng[1], rng[2])
+        total_combinations = len(setting.generate_settings())
+        use_ga = opt_cfg.get("algorithm", "bf") == "ga"
+        results = engine.run_ga_optimization(setting, output=False) if use_ga else engine.run_optimization(setting, output=False)
+        top_n = min(args.top_n, len(results))
+        formatted = []
+        for setting_dict, target_val, stats in results[:top_n]:
+            key_stats = {}
+            for k in ["total_return", "annual_return", "max_ddpercent", "sharpe_ratio", "total_trade_count", "winning_rate"]:
+                v = stats.get(k)
+                if v is not None:
+                    key_stats[k] = round(float(v), 4) if isinstance(v, float) else v
+            formatted.append({"params": setting_dict, target: round(float(target_val), 6) if target_val else 0, "stats": key_stats})
+        output = {"status": "completed", "target_metric": target, "algorithm": "ga" if use_ga else "bf",
+            "total_combinations": total_combinations, "bar_count": bar_count, "top_n": top_n,
+            "results": formatted, "best": formatted[0] if formatted else None}
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        return 0
+    except Exception as e:
+        import traceback
+        print(json.dumps({"status": "error", "error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()[-500:]}, ensure_ascii=False))
+        return 1
+
+
+def cmd_qmt_check(_args: argparse.Namespace) -> int:
+    """检测 QMT 模拟/实盘环境可用性，输出 JSON"""
+    result: Dict[str, Any] = {"xtquant": False, "qmt_path": "", "qmt_path_ok": False, "account_id": "", "ready": False, "hint": ""}
+    _orig_stdout = sys.stdout
+    sys.stdout = io.StringIO()  # xtquant 导入时会打印文档地址，抑制以保持 JSON 输出干净
+    try:
+        import xtquant  # type: ignore  # noqa: F401
+        result["xtquant"] = True
+    except ImportError:
+        pass
+    finally:
+        sys.stdout = _orig_stdout
+    qmt_path = os.getenv("QMT_PATH", "")
+    result["qmt_path"] = qmt_path
+    if qmt_path:
+        result["qmt_path_ok"] = (Path(qmt_path) / "userdata_mini").is_dir()
+    account_id = os.getenv("QMT_ACCOUNT_ID", "")
+    result["account_id"] = ("***" + account_id[-4:]) if len(account_id) > 4 else ("已配置" if account_id else "")
+    result["ready"] = result["xtquant"] and result["qmt_path_ok"] and bool(account_id)
+    if result["ready"]:
+        result["hint"] = "QMT 环境就绪，可进行模拟/实盘交易"
+    else:
+        missing = []
+        if not result["xtquant"]:
+            missing.append("xtquant 库（需安装 miniQMT SDK）")
+        if not qmt_path:
+            missing.append("QMT_PATH 环境变量（指向 QMT 安装目录）")
+        elif not result["qmt_path_ok"]:
+            missing.append(f"QMT_PATH={qmt_path} 下未找到 userdata_mini 目录，请确认 QMT 已安装且路径正确")
+        if not account_id:
+            missing.append("QMT_ACCOUNT_ID 环境变量")
+        result["hint"] = "缺少: " + "; ".join(missing)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["ready"] else 1
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.cmd == "submit":
@@ -1136,6 +1481,10 @@ def main() -> int:
         return cmd_list(args)
     if args.cmd == "config-doctor":
         return cmd_config_doctor(args)
+    if args.cmd == "qmt-check":
+        return cmd_qmt_check(args)
+    if args.cmd == "optimize":
+        return cmd_optimize(args)
     return 1
 
 

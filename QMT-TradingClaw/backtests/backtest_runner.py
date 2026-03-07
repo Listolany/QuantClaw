@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode, quote
 
-PROJECT_ROOT = Path(os.getenv("QMT_PROJECT_ROOT", Path(__file__).resolve().parents[1])).resolve()
+PROJECT_ROOT = Path(os.getenv("QUANTCLAW_ROOT", "") or os.getenv("QMT_PROJECT_ROOT", "") or str(Path(__file__).resolve().parents[1])).resolve()
 VNPY_QMT_PATH = PROJECT_ROOT / "vnpy_qmt"
 STRATEGIES_PATH = PROJECT_ROOT / "strategies"
 sys.path.insert(0, str(VNPY_QMT_PATH))
@@ -130,11 +130,15 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1):
                 nav = (capital + state["realized"] + unrealized) / capital
                 dt_str = data.datetime.strftime("%Y-%m-%d") if hasattr(data.datetime, "strftime") else str(data.datetime)[:10]
                 _report("/api/point", dt=dt_str, nav=f"{nav:.6f}")
+                if int(state["pos"]) > 0:
+                    sym = getattr(engine, "vt_symbol", "") or (vt_symbols[0] if vt_symbols else "")
+                    _report_post("/api/position_snapshot", {"date": dt_str, "positions": [{"symbol": sym, "volume": int(state["pos"]), "price": f"{data.close_price:.2f}", "value": f"{state['pos'] * data.close_price:.0f}"}]})
         engine.new_bar = wrap
-    else: # portfolio模式：仅上报进度（多标的nav估算复杂度高，用最终精确值替代）
+    else: # portfolio模式
         total = len(getattr(engine, "dts", []) or [])
         con_step = max(total // 20, 1) if total else 1
         old = engine.new_bars
+        vt_syms = vt_symbols
         def wrap(dt):
             try: old(dt)
             except Exception as e:
@@ -147,6 +151,12 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1):
             if MONITOR and (d % MONITOR_STEP == 0 or d == 1 or d == total):
                 pct = 20 + int(60 * d / max(total, 1))
                 _report("/api/progress", run_id=RUN_ID, status="running", stage=f"Portfolio回放 {d}/{total}", pct=min(pct, 80))
+                strat = engine.strategy
+                if strat and hasattr(strat, "get_pos"):
+                    dt_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+                    pos_list = [{"symbol": s, "volume": strat.get_pos(s)} for s in vt_syms if strat.get_pos(s) != 0]
+                    if pos_list:
+                        _report_post("/api/position_snapshot", {"date": dt_str, "positions": pos_list})
         engine.new_bars = wrap
     return state
 
@@ -183,6 +193,71 @@ def load_data(symbols_exchanges, interval, start, end, token, total_stages):
     if ok == 0: stage(2, total_stages, "failed", f"所有{n}个标的均无数据"); sys.exit(1)
     stage(2, total_stages, "success", f"数据加载完成 {ok}/{n}个标的")
 
+def _patch_lot_compliance(engine, vt_symbols, mode):
+    """引擎层兜底：下单手数自动向下取整至交易所合规（主板/创业板100整数倍，科创板200起+1股递增）"""
+    sym_lots = {}
+    for s in vt_symbols:
+        digits = "".join(c for c in s if c.isdigit())[:6]
+        sym_lots[s] = "star" if digits.startswith("688") else "main"
+    def _comply(vol, sym):
+        board = sym_lots.get(sym, "main")
+        if board == "star": return int(vol) if vol >= 200 else 0  #科创：200起+1股递增，向下取整到整数
+        return int(vol / 100) * 100  #主板/创业板：100整数倍
+    if mode == "cta":
+        _orig = engine.send_order
+        def _wrap(strategy, direction, offset, price, volume, stop, lock, net):
+            sym = getattr(strategy, "vt_symbol", vt_symbols[0] if vt_symbols else "")
+            adj = _comply(volume, sym)
+            if adj != int(volume) and adj > 0: p(f"[lot-fix] {sym} {volume}->{adj}股 (交易所合规取整)")
+            if adj <= 0: p(f"[lot-fix] {sym} {volume}股不足最低手数，跳过下单"); return []
+            return _orig(strategy, direction, offset, price, adj, stop, lock, net)
+        engine.send_order = _wrap
+    else:
+        _orig = engine.send_order
+        def _wrap(strategy, vt_symbol, direction, offset, price, volume, lock, net):
+            adj = _comply(volume, vt_symbol)
+            if adj != int(volume) and adj > 0: p(f"[lot-fix] {vt_symbol} {volume}->{adj}股 (交易所合规取整)")
+            if adj <= 0: p(f"[lot-fix] {vt_symbol} {volume}股不足最低手数，跳过下单"); return []
+            return _orig(strategy, vt_symbol, direction, offset, price, adj, lock, net)
+        engine.send_order = _wrap
+
+def _patch_t1_compliance(engine, interval):
+    """A股T+1兜底：分钟/小时级回测中，当日买入的股数当日不可卖出"""
+    if interval in (Interval.DAILY, Interval.WEEKLY):
+        return  #日线/周线天然隔日，无需T+1限制
+    t1 = {"today": None, "locked": 0, "t1_hits": 0}
+    _orig_bar = engine.new_bar
+    def _bar_wrap(data):
+        dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
+        if dt_date and dt_date != t1["today"]:
+            if t1["locked"] > 0: p(f"[T+1] 新交易日{dt_date}，解锁{t1['locked']}股昨日锁定持仓")
+            t1["today"] = dt_date; t1["locked"] = 0
+        _orig_bar(data)
+    engine.new_bar = _bar_wrap
+    _orig_send = engine.send_order
+    def _send_wrap(strategy, direction, offset, price, volume, stop, lock, net):
+        if direction == Direction.LONG:
+            result = _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
+            t1["locked"] += int(volume)
+            return result
+        else:  #卖出：扣减当日锁定的不可卖部分
+            total_pos = int(strategy.pos)
+            sellable = max(total_pos - t1["locked"], 0)
+            req_vol = int(volume)
+            if req_vol > sellable:
+                blocked = req_vol - sellable
+                t1["t1_hits"] += 1
+                if sellable > 0:
+                    p(f"[T+1] 卖出{req_vol}股→实际可卖{sellable}股(锁定{t1['locked']}股当日买入)")
+                    return _orig_send(strategy, direction, offset, price, sellable, stop, lock, net)
+                else:
+                    p(f"[T+1] 卖出{req_vol}股被拦截：全部{total_pos}股均为当日买入(锁定{t1['locked']})")
+                    return []
+            return _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
+    engine.send_order = _send_wrap
+    p(f"[T+1] A股T+1合规兜底已启用(分钟级回测)")
+    return t1
+
 # ========== 回测 ==========
 def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, rate, slippage, size, pricetick, strategy_params, total_stages):
     t0 = time.time()
@@ -201,6 +276,16 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
             rates={s: rate for s in vt_symbols}, slippages={s: slippage for s in vt_symbols},
             sizes={s: size for s in vt_symbols}, priceticks={s: pricetick for s in vt_symbols}, capital=capital)
         engine.add_strategy(strategy_cls, strategy_params)
+    _patch_lot_compliance(engine, vt_symbols, mode)
+    if mode == "cta":
+        _patch_t1_compliance(engine, interval)
+    if mode == "cta" and engine.strategy:
+        if not hasattr(engine.strategy, 'load_bars'):
+            engine.strategy.load_bars = lambda days=10, interval=None: engine.strategy.load_bar(days)  #兜底：CTA策略误用load_bars时降级为load_bar
+            p("[fix] CTA策略缺少load_bars，已自动兜底为load_bar")
+        if not hasattr(engine.strategy, 'capital') or getattr(engine.strategy, 'capital', 0) == 0:
+            engine.strategy.capital = capital  #兜底：注入capital参数
+            p(f"[fix] 策略缺少capital属性，已注入capital={capital}")
     engine.load_data()
     bar_count = len(engine.history_data) if mode == "cta" else len(getattr(engine, "dts", []) or [])
     p(f"  引擎参数: vt_symbols={vt_symbols} interval={interval} start={start} end={end}")
@@ -212,6 +297,16 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
         if mode == "cta": all_dates = [bar.datetime.strftime("%Y-%m-%d") for bar in (engine.history_data or [])]
         else: all_dates = [dt.strftime("%Y-%m-%d") for dt in (engine.dts or [])]
         _report_post("/api/init_axis", {"dates": all_dates})
+        try:
+            bench = _load_hs300(start, end)
+            if bench is not None and len(bench) > 5:
+                bnav = bench / float(bench.iloc[0])
+                bench_dates = [d.strftime("%Y-%m-%d") for d in bnav.index]
+                bench_vals = [round(float(v), 6) for v in bnav.values]
+                _report_post("/api/bench_data", {"dates": bench_dates, "bench": bench_vals})
+                p(f"  [monitor] 沪深300基准已推送({len(bench_dates)}点)")
+        except Exception as e:
+            p(f"  [monitor] 基准推送失败: {e}")
     state = _attach_progress(engine, mode, total_stages, capital, size)
     stage(3, total_stages, "running", f"{bar_count}根K线已加载，回放中...")
     engine.run_backtesting()
@@ -244,26 +339,58 @@ def print_stats(stats, total_stages):
             if val is not None:
                 try: s[k] = float(val)
                 except (ValueError, TypeError): s[k] = str(val)
-        if s: _report("/api/stats", **{k: str(v) for k, v in s.items()})
+        if s: _report_post("/api/stats", s)
     stage(4, total_stages, "success", "指标输出完成")
 
 # ========== 推送精确净值到monitor ==========
 
 def _extract_trades(engine):
     trades = list(getattr(engine, "trades", {}).values())
-    trade_list = []
+    trade_list, pos_map, cost_map = [], {}, {} # 按标的分组跟踪仓位，兼容CTA/Portfolio
     for t in trades:
         dt_str = t.datetime.strftime("%Y-%m-%d") if hasattr(t.datetime, "strftime") else str(t.datetime)[:10]
         direction = "BUY" if t.direction == Direction.LONG else "SELL"
-        price, volume = float(t.price), float(t.volume)
-        trade_list.append({"date": dt_str, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}"})
+        price, volume, pnl = float(t.price), float(t.volume), ""
+        sym = getattr(t, 'vt_symbol', '') or ''
+        pos, avg_cost = pos_map.get(sym, 0.0), cost_map.get(sym, 0.0)
+        if direction == "BUY":
+            new_pos = pos + volume
+            avg_cost = (avg_cost * pos + price * volume) / new_pos if new_pos > 0 else 0
+            pos = new_pos
+        else:
+            if avg_cost > 0: pnl = f"{(price - avg_cost) * volume:.2f}"
+            pos = max(pos - volume, 0)
+            if pos == 0: avg_cost = 0
+        pos_map[sym], cost_map[sym] = pos, avg_cost
+        trade_list.append({"date": dt_str, "symbol": sym, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}", "pnl": pnl})
     return trade_list
+
+def _extract_positions(trade_list):
+    """从交易记录推算最终持仓"""
+    pos_map = {}
+    for t in trade_list:
+        sym = t.get("symbol", "")
+        vol = float(t.get("volume", 0))
+        price = float(t.get("price", 0))
+        if t["direction"] == "BUY":
+            cur = pos_map.get(sym, {"symbol": sym, "volume": 0, "cost": 0.0, "amount": 0.0})
+            cur["amount"] += price * vol
+            cur["volume"] += int(vol)
+            cur["cost"] = cur["amount"] / cur["volume"] if cur["volume"] > 0 else 0
+            pos_map[sym] = cur
+        else:
+            if sym in pos_map:
+                pos_map[sym]["volume"] -= int(vol)
+                if pos_map[sym]["volume"] <= 0: del pos_map[sym]
+    return [{"symbol": v["symbol"], "volume": v["volume"], "cost": f"{v['cost']:.2f}", "market_value": f"{v['amount']:.2f}"} for v in pos_map.values() if v["volume"] > 0]
 
 def _push_trades(trade_list):
     if not MONITOR or not trade_list: return
     try:
         _report_post("/api/trades", {"trades": trade_list})
         _report("/api/log", msg=f"Trades pushed ({len(trade_list)})")
+        positions = _extract_positions(trade_list)
+        if positions: _report_post("/api/positions", {"positions": positions})
     except Exception as e:
         p(f"[warn] Push trades failed: {e}")
 
@@ -409,8 +536,8 @@ def main():
     ap.add_argument("--mode", choices=["cta", "portfolio"], default="cta")
     _d_end = datetime.now().strftime("%Y%m%d"); _d_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
     ap.add_argument("--start", default=_d_start); ap.add_argument("--end", default=_d_end)
-    ap.add_argument("--interval", default="DAILY", choices=["DAILY", "MINUTE", "HOUR", "WEEKLY"])
-    ap.add_argument("--capital", type=float, default=100000); ap.add_argument("--rate", type=float, default=0.0003)
+    ap.add_argument("--interval", default="DAILY", choices=["DAILY", "MINUTE", "HOUR", "WEEKLY", "5MIN", "15MIN", "30MIN"])
+    ap.add_argument("--capital", type=float, default=1000000); ap.add_argument("--rate", type=float, default=0.0003)
     ap.add_argument("--slippage", type=float, default=0.01); ap.add_argument("--size", type=float, default=1)
     ap.add_argument("--pricetick", type=float, default=0.01)
     ap.add_argument("--token", default=os.getenv("QGDATA_TOKEN", ""))
@@ -427,8 +554,16 @@ def main():
     if args.monitor_port > 0: _start_monitor(args.monitor_port)
 
     vt_symbols = [_normalize_vt_symbol(s) for s in args.symbols.split(",") if s.strip()]
-    interval = getattr(Interval, args.interval)
-    start = datetime.strptime(args.start, "%Y%m%d"); end = datetime.strptime(args.end, "%Y%m%d")
+    _min_map = {"5MIN": ("MINUTE", "5min"), "15MIN": ("MINUTE", "15min"), "30MIN": ("MINUTE", "30min")}
+    if args.interval in _min_map:
+        _base, _freq = _min_map[args.interval]
+        interval = getattr(Interval, _base)
+        import vnpy_xt.qg_datafeed as _qdf; _qdf._MINUTE_FREQ_OVERRIDE = _freq  #覆盖datafeed的分钟频率
+        p(f"[interval] {args.interval} → Interval.{_base} + qgdata freq={_freq}")
+    else:
+        interval = getattr(Interval, args.interval)
+    _dfmt = "%Y-%m-%d" if "-" in args.start else "%Y%m%d"
+    start = datetime.strptime(args.start, _dfmt); end = datetime.strptime(args.end, _dfmt)
     strategy_params = json.loads(args.params)
     title = args.title or f"{','.join(vt_symbols[:3])} 回测净值曲线"
     symbols_exchanges = [(s.split(".")[0], Exchange(s.split(".")[1])) for s in vt_symbols]
@@ -476,10 +611,10 @@ if __name__ == "__main__":
         print(tb, flush=True)
         # 尝试向监控服务发送失败状态
         try:
-            from urllib.request import urlopen, Request
-            from urllib.parse import urlencode, quote
-            msg = f"{type(e).__name__}: {str(e)[:80]}"
-            urlopen(f"http://127.0.0.1:8765/api/step?step=3&status=failed&title=回测执行&msg={quote(msg)}", timeout=3)
+            if MONITOR:
+                from urllib.parse import quote
+                msg = f"{type(e).__name__}: {str(e)[:80]}"
+                urlopen(f"{MONITOR}/api/step?step=3&status=failed&title=回测执行&msg={quote(msg)}", timeout=3)
         except: pass
         sys.exit(1)
 

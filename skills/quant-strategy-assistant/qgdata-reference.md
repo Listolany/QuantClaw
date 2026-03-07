@@ -8,7 +8,7 @@ qg.set_token("token")
 pro = qg.pro_api(timeout=30.0)
 ```
 
-调用：`pro.接口名(参数...)` → `pd.DataFrame`。完整文档：`d:\AGIclass\QMT-TradingClaw\qgdata_docs\`
+调用：`pro.接口名(参数...)` → `pd.DataFrame`。完整文档：`${QUANTCLAW_ROOT}/qgdata_docs/`
 
 ## 代码格式转换
 

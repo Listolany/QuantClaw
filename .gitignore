@@ -26,3 +26,12 @@ QMT-TradingClaw/backtests/.run_lock
 # Build artifacts
 *.egg-info/
 .pytest_cache/
+# Agent生成的策略文件（每次回测自动生成）
+QMT-TradingClaw/strategies/*.py
+!QMT-TradingClaw/strategies/__init__.py
+
+# 测试报告
+e2e_test_report*.md
+
+# Cursor rules（项目本地）
+.cursor/

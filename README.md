@@ -4,9 +4,10 @@
 你只需要给一句自然语言需求（例如“贵州茅台 5 日线上穿 10 日线买入，下穿卖出”），系统会自动完成：
 
 1. 数据能力检查（是否满足该策略的数据接口要求）
-2. 策略生成
-3. 回测执行
-4. 监控页实时展示（代码、进度、资金曲线、交易记录）
+2. 自动判定策略类型（CTA 单标的 / Portfolio 多标的组合）
+3. 策略代码生成（LLM 根据自然语言自动编写 vnpy 策略）
+4. 回测执行（支持日线/5分钟/15分钟/30分钟/小时线/周线，内置 A 股 T+1 合规兜底）
+5. 监控页实时展示（代码、进度、收益曲线动态增长、交易记录含标的、每日持仓变化）
 
 ## 适合谁用
 
@@ -47,7 +48,7 @@ quant-claw/
 
 > 如果你暂时不接 OpenClaw，也可以只用本仓库的 Python 脚本直接回测；但要有 `QGDATA_TOKEN`。
 >
-> **重要提示（实盘环境）**：券商 QMT 量化平台目前仅有 Windows 版本，因此 **Linux 仅建议用于回测**；如需模拟盘/实盘交易，请优先使用 Windows。
+> **回测与实盘分离**：回测基于 vnpy 引擎，**任何平台**均可运行，不依赖 QMT。支持 CTA（单标的择时）和 Portfolio（多标的组合/轮动）两种策略模式，系统根据自然语言描述自动路由。支持多种 K 线周期（日线/5分钟/15分钟/30分钟/小时线/周线），分钟级回测内置 A 股 T+1 合规兜底（当日买入不可当日卖出）。模拟盘/实盘需要 QMT 交易端，运行 `qmt-check` 可一键检测环境是否就绪。
 
 ## 依赖与账户清单（建议逐项打勾）
 
@@ -58,7 +59,7 @@ quant-claw/
 - [ ] 已在 qgdata 平台开通 Pro 并拿到 `QGDATA_TOKEN`
 - [ ] 有一个可公网访问的 IP/域名（用于监控链接）
 - [ ] 安全组/防火墙放通监控白名单端口（默认 `8767`）
-- [ ] 若要模拟盘/实盘，已准备 Windows 环境（QMT 仅支持 Windows）
+- [ ] 若要模拟盘/实盘，已安装并启动 QMT 交易端（系统自动检测可用性）
 
 ## 第一步：安装 Python 依赖
 
@@ -66,7 +67,7 @@ quant-claw/
 
 ```bash
 pip install -U pip
-pip install qgdata filelock
+pip install qgdata filelock vnpy_portfoliostrategy
 pip install -e QMT-TradingClaw/vnpy_qmt
 ```
 
@@ -104,7 +105,7 @@ vim QMT-TradingClaw/.env
 python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor
 ```
 
-> `config-doctor` 会逐项检查 QMT_PROJECT_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。
+> `config-doctor` 会逐项检查 QUANTCLAW_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。
 
 <details>
 <summary>如果不想用 .env 文件，也可以直接 export（点击展开）</summary>
@@ -112,7 +113,7 @@ python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor
 ### Linux/macOS
 
 ```bash
-export QMT_PROJECT_ROOT="$(pwd)/QMT-TradingClaw"
+export QUANTCLAW_ROOT="$(pwd)/QMT-TradingClaw"
 export PYTHON_BIN="python3"
 export QGDATA_TOKEN="你的qgdata_token"
 export MONITOR_PUBLIC_BASE="http://你的公网IP或域名"
@@ -122,7 +123,7 @@ export ORCH_MONITOR_PORT_CANDIDATES="8767"
 ### Windows（PowerShell）
 
 ```powershell
-$env:QMT_PROJECT_ROOT = "$pwd\QMT-TradingClaw"
+$env:QUANTCLAW_ROOT = "$pwd\QMT-TradingClaw"
 $env:PYTHON_BIN = "python"
 $env:QGDATA_TOKEN = "你的qgdata_token"
 $env:MONITOR_PUBLIC_BASE = "http://你的公网IP或域名"
@@ -136,14 +137,14 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 先做能力闸门检查：
 
 ```bash
-"$PYTHON_BIN" "$QMT_PROJECT_ROOT/backtests/data_capability_guard.py" \
+"$PYTHON_BIN" "$QUANTCLAW_ROOT/backtests/data_capability_guard.py" \
   --requirement "海天味业，5日上穿10日金叉买入，死叉卖出"
 ```
 
 再提交编排任务：
 
 ```bash
-"$PYTHON_BIN" "$QMT_PROJECT_ROOT/backtests/pipeline_orchestrator.py" submit \
+"$PYTHON_BIN" "$QUANTCLAW_ROOT/backtests/pipeline_orchestrator.py" submit \
   --requirement "海天味业，5日上穿10日金叉买入，死叉卖出" \
   --monitor-public-base "$MONITOR_PUBLIC_BASE" \
   --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8767}" \
@@ -162,7 +163,7 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 如果你只想要文本摘要，可以按 `run_id` 查询：
 
 ```bash
-"$PYTHON_BIN" "$QMT_PROJECT_ROOT/backtests/pipeline_orchestrator.py" status --run-id "你的run_id"
+"$PYTHON_BIN" "$QUANTCLAW_ROOT/backtests/pipeline_orchestrator.py" status --run-id "你的run_id"
 ```
 
 ## 常见问题
@@ -189,10 +190,39 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 - 当前流程优先保证“首响立即返回监控链接”。  
 - 回测完成后，请主动执行 `status --run-id` 或在监控页查看结果。
 
-### 5）Linux 可以直接做实盘吗
+### 5）回测需要 QMT 吗
 
-- 不建议。券商 QMT 平台当前只有 Windows 版本。
-- Linux 建议仅用于研究和回测；模拟盘/实盘请放在 Windows 环境执行。
+- **不需要。** 回测基于 vnpy 引擎，任何平台均可运行。
+- 模拟盘/实盘依赖 QMT 交易端，可通过 `qmt-check` 命令检测环境是否就绪：
+
+```bash
+python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py qmt-check
+```
+
+需配置 `QMT_PATH`（QMT 安装目录）和 `QMT_ACCOUNT_ID`（资金账号），详见 `.env.example`。
+
+### 6）支持哪些 K 线周期
+
+| 周期 | 参数 | 说明 |
+|------|------|------|
+| 日线 | `DAILY` | 默认周期 |
+| 5 分钟 | `5MIN` | A 股最常用分钟级别，数据源 qgdata 直接提供 |
+| 15 分钟 | `15MIN` | |
+| 30 分钟 | `30MIN` | |
+| 小时线 | `HOUR` | 60 分钟 |
+| 周线 | `WEEKLY` | |
+
+分钟级回测自动启用 A 股 T+1 合规兜底：当日买入的股数标记"锁定"，当日卖出信号自动扣减锁定部分，仅可卖出昨日及以前的持仓。
+
+### 7）监控页有哪些面板
+
+- 📋 策略描述 — 需求参数确认
+- 💻 策略代码 — 语法高亮展示
+- 📈 收益曲线 — 从左到右动态增长 + 沪深300基准同步对比
+- 📊 每日收益 — 柱状图
+- 📉 回测统计 — 核心指标表
+- 📝 交易记录 — 含标的列、分页
+- 📦 每日持仓变化 — 逐日持仓快照
 
 ## 安全建议
 

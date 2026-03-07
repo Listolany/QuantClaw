@@ -7,11 +7,11 @@ from urllib.parse import urlparse, parse_qs
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    allow_reuse_address = False
+    allow_reuse_address = True
 
 STATE = {"run_id": "", "status": "waiting", "stage": "", "pct": 0, "dates": [], "points": [],
     "stats": {}, "logs": [], "done": False, "steps": {}, "requirement": {}, "code": "",
-    "code_file": "", "final": None, "trades": None, "report_urls": {}, "error": None}
+    "code_file": "", "final": None, "trades": None, "positions": None, "position_snapshots": [], "bench_data": None, "report_urls": {}, "error": None}
 LOCK = threading.Lock()
 CLIENTS = []
 
@@ -63,8 +63,8 @@ body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(1
 .err-tb{background:#1e1e1e;color:#f1f5f9;font-size:12px;padding:14px;border-radius:10px;max-height:200px;overflow:auto;font-family:'Cascadia Code','Fira Code',monospace;line-height:1.5;margin:12px 0;display:none}
 .err-toggle{background:none;border:1px solid #fca5a5;color:#dc2626;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600}
 .err-toggle:hover{background:#fee2e2}
-.err-guide{margin-top:16px;padding:14px;background:#fff;border-radius:10px;border:1px solid #e2e8f0;color:#475569;font-size:13px;line-height:1.6}
-.err-guide strong{color:#1e293b}
+.err-guide{margin-top:16px;padding:16px 20px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border-radius:12px;border:1px solid #93c5fd;color:#1e40af;font-size:14px;line-height:1.7}
+.err-guide strong{color:#1e3a8a;font-size:15px}
 .wrap{max-width:1200px;margin:0 auto;padding:24px 20px}
 .card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;margin-bottom:20px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04)}
 .card-h{padding:16px 20px;display:flex;align-items:center;gap:12px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
@@ -146,10 +146,18 @@ pre.code-block code{font-family:'Cascadia Code','Fira Code','Consolas',monospace
     <div class="card-h"><span class="title">📉 回测结果统计</span><span class="badge pill-w" id="b5">等待</span></div>
     <div class="card-b empty" id="c5">等待回测完成...</div>
   </div>
+  <div class="card" id="p-conclusion" style="display:none">
+    <div class="card-h"><span class="title">🏆 策略体检</span><span class="badge pill-s" id="b-conclusion">评估</span></div>
+    <div class="card-b" id="c-conclusion"></div>
+  </div>
   <div class="card" id="p6">
     <div class="card-h"><span class="title">📝 交易记录</span></div>
     <div class="card-b" id="c6"><div class="empty">暂无交易记录</div></div>
     <div class="page-nav" id="pageNav" style="display:none"></div>
+  </div>
+  <div class="card" id="p7">
+    <div class="card-h"><span class="title">📦 每日持仓变化</span></div>
+    <div class="card-b" id="c7"><div class="empty">等待持仓数据...</div></div>
   </div>
   <div style="font-size:12px;color:#64748b;padding:0 4px;margin-top:16px">
     <strong>📌 日志</strong>
@@ -173,7 +181,7 @@ function addLog(m){const e=document.getElementById('logs');e.innerHTML+='<div>['
 const chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});
 const dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
 const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',
-  tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14],shadowBlur:8,shadowColor:'rgba(0,0,0,.1)'},
+  tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14],shadowBlur:8,shadowColor:'rgba(0,0,0,.1)',formatter:function(ps){var h=ps[0].axisValue;ps.forEach(function(p){if(p.value!=null){h+='<br/>'+p.marker+p.seriesName+': '+p.value.toFixed(4)+' <b>('+((p.value-1)*100).toFixed(2)+'%)</b>'}});return h}},
   legend:{data:['策略净值','沪深 300 基准'],top:10,right:16,textStyle:{color:'#64748b',fontSize:12}},
   grid:{left:64,right:32,top:52,bottom:48},
   xAxis:{type:'category',data:[],axisLabel:{color:'#94a3b8',fontSize:11,rotate:0},axisLine:{lineStyle:{color:'#e2e8f0'}},boundaryGap:false},
@@ -188,15 +196,15 @@ const dailyOpt={animation:true,animationDuration:300,
   grid:{left:56,right:24,top:36,bottom:48},
   xAxis:{type:'category',data:[],axisLabel:{color:'#94a3b8',fontSize:10},axisLine:{lineStyle:{color:'#e2e8f0'}}},
   yAxis:{type:'value',name:'日收益%',nameTextStyle:{color:'#64748b'},axisLabel:{color:'#64748b',fontSize:11,formatter:v=>v.toFixed(2)+'%'},axisLine:{lineStyle:{color:'#e2e8f0'}},splitLine:{lineStyle:{color:'#f1f5f9'}}},
-  series:[{name:'日收益',type:'bar',data:[],itemStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'#16a34a'},{offset:.5,color:'#84cc16'},{offset:1,color:'#dc2626'}]}},barWidth:'60%',showBackground:true,backgroundStyle:{color:'rgba(0,0,0,.02)'}}]};
+  series:[{name:'日收益',type:'bar',data:[],itemStyle:{color:function(p){return p.data>=0?'#16a34a':'#dc2626'}},barWidth:'60%',showBackground:true,backgroundStyle:{color:'rgba(0,0,0,.02)'}}]};
 dailyChart.setOption(dailyOpt);
 window.addEventListener('resize',()=>{chart.resize();dailyChart.resize()});
 let dateIdx={},tradeData=[],currentPage=1,pageSize=10;
 function renderTrades(){
   const start=(currentPage-1)*pageSize,end=start+pageSize;
   const page=tradeData.slice(start,end);
-  let h='<table class="trade-table"><thead><tr><th>日期</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th></tr></thead><tbody>';
-  page.forEach(t=>{const isBuy=t.direction==='买入'||t.direction==='BUY';const cls=isBuy?'buy':'sell';const dir=isBuy?'买入':'卖出';h+='<tr><td>'+t.date+'</td><td class="'+cls+'">'+dir+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td></tr>'});
+  let h='<table class="trade-table"><thead><tr><th>日期</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>盈亏</th></tr></thead><tbody>';
+  page.forEach(t=>{const isBuy=t.direction==='买入'||t.direction==='BUY';const cls=isBuy?'buy':'sell';const dir=isBuy?'买入':'卖出';const pnl=t.pnl||'';const ps=pnl?(parseFloat(pnl)>=0?'color:#16a34a;font-weight:600':'color:#dc2626;font-weight:600'):'';const sym=t.symbol||'';h+='<tr><td>'+t.date+'</td><td>'+sym+'</td><td class="'+cls+'">'+dir+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td><td style="'+ps+'">'+pnl+'</td></tr>'});
   h+='</tbody></table>';document.getElementById('c6').innerHTML=h||'<div class="empty">暂无交易记录</div>';
   const total=Math.ceil(tradeData.length/pageSize);
   const nav=document.getElementById('pageNav');
@@ -212,7 +220,9 @@ es.addEventListener('step',e=>{const d=JSON.parse(e.data);addLog('['+d.step+'] '
 });
 es.addEventListener('requirement',e=>{const d=JSON.parse(e.data);setBadge('b1','success');
   const el=document.getElementById('c1');el.classList.remove('empty');
-  let h='<div class="req-grid">';for(const[k,v] of Object.entries(d))h+='<div class="req-item"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>';
+  const km={symbols:'标的',fast_window:'快线周期',slow_window:'慢线周期',interval:'K线周期',direction:'方向',mode:'策略模式',requirement:'需求描述',run_id:'运行ID'};
+  const vm={bullish:'看涨',bearish:'看跌',DAILY:'日线',MINUTE:'分钟线',HOUR:'小时线',WEEKLY:'周线',cta:'CTA单标的',portfolio:'Portfolio组合'};
+  let h='<div class="req-grid">';for(const[k,v] of Object.entries(d)){const lbl=km[k]||k;const val=Array.isArray(v)?v.join(', '):(vm[v]||v);h+='<div class="req-item"><div class="k">'+lbl+'</div><div class="v">'+val+'</div></div>'}
   el.innerHTML=h+'</div>'});
 es.addEventListener('code',e=>{const d=JSON.parse(e.data);setBadge('b2','success');
   const el=document.getElementById('c2');el.classList.remove('empty');
@@ -224,13 +234,17 @@ es.addEventListener('progress',e=>{const d=JSON.parse(e.data);
   if(d.status==='running'||pct>0){setBadge('b3',d.status||'running')}
   if(d.status==='failed'){setBadge('b3','failed');const g=document.getElementById('gpill');g.className='pill pill-f';g.textContent='失败'}
 });
-es.addEventListener('init_axis',e=>{const d=JSON.parse(e.data);dateIdx={};
-  chartOpt.xAxis.data=d.dates;chartOpt.series[0].data=new Array(d.dates.length).fill(null);chartOpt.series[1].data=new Array(d.dates.length).fill(null);
+let allDates=[],benchMap={};
+es.addEventListener('init_axis',e=>{const d=JSON.parse(e.data);dateIdx={};allDates=d.dates;
+  chartOpt.xAxis.data=[];chartOpt.series[0].data=[];chartOpt.series[1].data=[];
   d.dates.forEach((dt,i)=>dateIdx[dt]=i);chart.setOption(chartOpt,true);setBadge('b3','running')});
 es.addEventListener('point',e=>{const d=JSON.parse(e.data);
-  const i=dateIdx[d.dt];if(i!==undefined){chartOpt.series[0].data[i]=parseFloat(d.nav)}
-  else{chartOpt.xAxis.data.push(d.dt);chartOpt.series[0].data.push(parseFloat(d.nav));chartOpt.series[1].data.push(null)}
+  const nav=parseFloat(d.nav);
+  chartOpt.xAxis.data.push(d.dt);chartOpt.series[0].data.push(nav);
+  chartOpt.series[1].data.push(benchMap[d.dt]||null);
   chart.setOption(chartOpt)});
+es.addEventListener('bench_data',e=>{const d=JSON.parse(e.data);
+  if(d.dates&&d.bench){d.dates.forEach((dt,i)=>{benchMap[dt]=d.bench[i]})}});
 es.addEventListener('final_chart',e=>{const d=JSON.parse(e.data);
   chartOpt.xAxis.data=d.dates;chartOpt.series[0].data=d.navs;chartOpt.series[1].data=d.bench||[];
   chart.setOption(chartOpt,true);setBadge('b3','success');document.getElementById('bar3').style.width='100%';
@@ -244,12 +258,26 @@ es.addEventListener('final_chart',e=>{const d=JSON.parse(e.data);
   setBadge('b4','success')});
 es.addEventListener('stats',e=>{const d=JSON.parse(e.data);setBadge('b5','success');
   const el=document.getElementById('c5');el.classList.remove('empty');
-  const fmt={total_return:['总收益率',true],annual_return:['年化收益',true],max_ddpercent:['最大回撤',true],sharpe_ratio:['夏普比率',true],total_trade_count:['交易次数',false],total_days:['交易天数',false],profit_days:['盈利天数',false],loss_days:['亏损天数',false]};
+  const fmt={total_return:['总收益率',true],annual_return:['年化收益',true],max_ddpercent:['最大回撤',true],sharpe_ratio:['夏普比率',true],winning_rate:['胜率',true],total_net_pnl:['总盈亏',false],total_trade_count:['交易次数',false],total_days:['交易天数',false],profit_days:['盈利天数',false],loss_days:['亏损天数',false]};
   let h='<div class="stats-grid">';for(const[k,[lb,isPct]] of Object.entries(fmt)){const v=d[k];if(v===undefined)continue;
     const n=typeof v==='number';let disp=n?(isPct?v.toFixed(2)+'%':v.toFixed(4)):v;
     const c=n?(v>=0?'pos':'neg'):'neu';
     h+='<div class="sc"><div class="lb">'+lb+'</div><div class="vl '+c+'">'+disp+'</div></div>'}
-  el.innerHTML=h+'</div>'});
+  el.innerHTML=h+'</div>';
+  var tr=parseFloat(d.total_return)||0,sr=parseFloat(d.sharpe_ratio)||0,dd=Math.abs(parseFloat(d.max_ddpercent)||0),wr=parseFloat(d.winning_rate)||0;
+  var sc=0;if(sr>=1.5)sc+=3;else if(sr>=1)sc+=2;else if(sr>=0.5)sc+=1;if(tr>=30)sc+=3;else if(tr>=10)sc+=2;else if(tr>=0)sc+=1;if(dd<=10)sc+=2;else if(dd<=20)sc+=1;if(wr>=50)sc+=2;else if(wr>=40)sc+=1;
+  var gs=[['S',10],['A',7],['B',5],['C',3],['D',0]],gd='D',gc='#dc2626';
+  for(var i=0;i<gs.length;i++)if(sc>=gs[i][1]){gd=gs[i][0];break}
+  gc=sc>=7?'#16a34a':sc>=5?'#d97706':'#dc2626';
+  var gl=sc>=7?'策略表现优秀':sc>=5?'策略表现良好':sc>=3?'策略表现一般':'策略表现较差';
+  var pts=[];
+  pts.push((tr>=20?'✅ ':tr>=0?'⚠️ ':'❌ ')+'总收益 '+tr.toFixed(1)+'%'+(tr>=20?'，表现出色':tr>=0?'，收益偏低':'，策略亏损'));
+  pts.push((sr>=1?'✅ ':sr>=0.5?'⚠️ ':'❌ ')+'夏普比率 '+sr.toFixed(2)+(sr>=1?'，风险收益良好':sr>=0.5?'，风险收益一般':'，风险收益较差'));
+  pts.push((dd<=15?'✅ ':dd<=25?'⚠️ ':'❌ ')+'最大回撤 '+dd.toFixed(1)+'%'+(dd<=15?'，风控良好':dd<=25?'，有一定风险':'，回撤过大'));
+  if(wr>0)pts.push((wr>=50?'✅ ':wr>=40?'⚠️ ':'❌ ')+'胜率 '+wr.toFixed(1)+'%'+(wr>=50?'，胜率健康':wr>=40?'，胜率偏低':'，胜率不足'));
+  var nxt=sc>=7?'可尝试「优化参数」进一步提升，或进入「模拟盘」验证实盘效果。':sc>=5?'建议通过「优化参数」调整策略参数以提升表现。':'当前策略需改进，请调整策略逻辑后重新回测。';
+  var cc=document.getElementById('p-conclusion');cc.style.display='block';
+  document.getElementById('c-conclusion').innerHTML='<div style="text-align:center;padding:16px 0"><div style="font-size:32px;font-weight:900;color:'+gc+'">'+gd+'级</div><div style="font-size:14px;font-weight:600;color:#475569;margin-top:4px">'+gl+'</div></div><div style="display:flex;flex-direction:column;gap:6px;margin:12px 0">'+pts.map(function(p){return'<div style="padding:10px 14px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;font-size:13px">'+p+'</div>'}).join('')+'</div><div style="padding:12px;background:linear-gradient(135deg,#eff6ff,#f0f9ff);border-radius:10px;border:1px solid #dbeafe;font-size:13px;color:#1e40af;font-weight:600">💡 '+nxt+'</div>'});
 es.addEventListener('trades',e=>{const d=JSON.parse(e.data);tradeData=d.trades||[];currentPage=1;renderTrades()});
 es.addEventListener('log',e=>{const d=JSON.parse(e.data);addLog(d.msg||'')});
 es.addEventListener('done',e=>{const g=document.getElementById('gpill');g.className='pill pill-s';g.textContent='已完成';
@@ -262,7 +290,21 @@ es.addEventListener('error_info',e=>{const d=JSON.parse(e.data);
   document.getElementById('errMsg').textContent=(d.step?'['+d.step+'] ':'')+d.message;
   if(d.traceback){document.getElementById('errTb').textContent=d.traceback}
   const g=document.getElementById('gpill');g.className='pill pill-f';g.textContent='失败';
-  addLog('❌ '+d.error_type+': '+d.message)});
+  addLog('❌ '+d.error_type+': '+d.message);addLog('💡 请回到对话页输入「查看结果」，AI 将自动诊断并修复')});
+const posHistory=[];
+es.addEventListener('position_snapshot',e=>{const d=JSON.parse(e.data);
+  if(d.positions&&d.positions.length>0){posHistory.push(d);renderPositions()}});
+es.addEventListener('positions',e=>{const d=JSON.parse(e.data);const ps=d.positions||[];
+  if(ps.length>0){posHistory.push({date:'最终',positions:ps});renderPositions()}});
+function renderPositions(){
+  const el=document.getElementById('c7');
+  const last20=posHistory.slice(-20);
+  let h='<table class="trade-table"><thead><tr><th>日期</th><th>标的</th><th>持仓(股)</th><th>现价</th><th>市值</th></tr></thead><tbody>';
+  last20.forEach(snap=>{const dt=snap.date||'';snap.positions.forEach((p,i)=>{
+    h+='<tr><td>'+(i===0?dt:'')+'</td><td>'+p.symbol+'</td><td>'+p.volume+'</td><td>'+(p.price||'-')+'</td><td>'+(p.value||p.market_value||'-')+'</td></tr>'})});
+  h+='</tbody></table>';
+  if(posHistory.length>20)h+='<div style="text-align:center;color:#94a3b8;font-size:12px;padding:8px">显示最近20条，共'+posHistory.length+'条持仓快照</div>';
+  el.innerHTML=h}
 es.onerror=()=>{addLog('⚠️ 连接断开，自动重连...')};
 </script></body></html>"""
 
@@ -286,17 +328,26 @@ class Handler(BaseHTTPRequestHandler):
             if s.get("requirement"): self._sse_send("requirement", s["requirement"])
             if s.get("code"): self._sse_send("code", {"filename": s["code_file"], "content": s["code"]})
             if s.get("dates"): self._sse_send("init_axis", {"dates": s["dates"]})
+            if s.get("bench_data"): self._sse_send("bench_data", s["bench_data"])
             for pt in s.get("points", []): self._sse_send("point", pt)
             if s.get("final"): self._sse_send("final_chart", s["final"])
             if s.get("stats"): self._sse_send("stats", s["stats"])
             if s.get("trades") is not None: self._sse_send("trades", {"trades": s["trades"]})
+            if s.get("positions") is not None: self._sse_send("positions", {"positions": s["positions"]})
+            for ps in s.get("position_snapshots", []): self._sse_send("position_snapshot", ps)
             if s.get("report_urls"): self._sse_send("report_urls", s["report_urls"])
             if s.get("error"): self._sse_send("error_info", s["error"])
             for st in s.get("steps", {}).values(): self._sse_send("step", st)
             if s.get("done"): self._sse_send("done", {})
             self.wfile.flush()
             try:
-                while not STATE["done"]: time.sleep(1)
+                _hb = 0
+                while not STATE["done"]:
+                    time.sleep(1); _hb += 1
+                    if _hb >= 15:
+                        _hb = 0
+                        try: self.wfile.write(b": heartbeat\n\n"); self.wfile.flush()
+                        except Exception: break
                 time.sleep(5)
             except Exception: pass
         elif path == "/api/step":
@@ -365,6 +416,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json_ok()
             with LOCK: STATE["trades"] = data.get("trades", [])
             broadcast("trades", data)
+        elif path == "/api/positions":
+            self._json_ok()
+            with LOCK: STATE["positions"] = data.get("positions", [])
+            broadcast("positions", data)
+        elif path == "/api/position_snapshot":
+            self._json_ok()
+            with LOCK: STATE["position_snapshots"].append(data)
+            broadcast("position_snapshot", data)
+        elif path == "/api/bench_data":
+            self._json_ok()
+            with LOCK: STATE["bench_data"] = data
+            broadcast("bench_data", data)
+        elif path == "/api/stats":
+            self._json_ok()
+            with LOCK: STATE["stats"] = data
+            broadcast("stats", data)
         elif path == "/api/report_urls":
             self._json_ok()
             with LOCK: STATE["report_urls"] = data
@@ -387,19 +454,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: pass
 
 def _kill_port(port):
-    import socket, subprocess
+    import socket, subprocess, platform
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1)
         if s.connect_ex(("127.0.0.1", port)) != 0: s.close(); return
         s.close()
     except Exception: return
+    is_win = platform.system() == "Windows"
     for _ in range(3):
         try:
-            subprocess.run(["powershell", "-NoProfile", "-Command",
-                f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue).OwningProcess | Sort-Object -Unique | ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"],
-                timeout=8, capture_output=True, text=True)
+            if is_win:
+                subprocess.run(["powershell", "-NoProfile", "-Command",
+                    f"(Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue).OwningProcess | Sort-Object -Unique | ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"],
+                    timeout=8, capture_output=True, text=True)
+            else:
+                subprocess.run(f"lsof -ti:{port} | xargs -r kill -9 2>/dev/null || fuser -k {port}/tcp 2>/dev/null", shell=True, timeout=5, capture_output=True, text=True)
         except Exception: pass
-        time.sleep(1.5)
+        time.sleep(1.5 if is_win else 0.5)
         try:
             t = socket.socket(socket.AF_INET, socket.SOCK_STREAM); t.settimeout(1)
             if t.connect_ex(("127.0.0.1", port)) != 0: t.close(); return
@@ -408,7 +479,7 @@ def _kill_port(port):
     print(f"[warn] 端口 {port} 清理 3 次仍被占用", flush=True)
 
 MONITOR_MAX_IDLE_SEC = int(os.environ.get("MONITOR_MAX_IDLE_SEC", "1800"))  # 30min 兜底自杀
-MONITOR_DONE_KEEPALIVE_SEC = int(os.environ.get("MONITOR_DONE_KEEPALIVE_SEC", "90"))  # done后保留窗口
+MONITOR_DONE_KEEPALIVE_SEC = int(os.environ.get("MONITOR_DONE_KEEPALIVE_SEC", "600"))  # done后保留10min供用户查看
 
 
 def main():

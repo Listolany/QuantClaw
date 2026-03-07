@@ -23,8 +23,9 @@ INTERVAL_VT2QG_API: dict[Interval, str] = { #VeighNa周期 -> qgdata接口名
     Interval.DAILY: "daily", Interval.WEEKLY: "weekly",
 }
 INTERVAL_VT2QG_FREQ: dict[Interval, str] = { #VeighNa周期 -> qgdata freq参数(仅stk_mins)
-    Interval.MINUTE: "1min", Interval.HOUR: "60min",
+    Interval.MINUTE: "5min", Interval.HOUR: "60min",  #MINUTE默认5分钟线（A股最常用的分钟级别）
 }
+_MINUTE_FREQ_OVERRIDE: str = ""  #运行时可覆盖：如设为"1min"则加载1分钟线
 
 def _safe_float(val, default: float = 0.0) -> float: #安全的float转换，处理None/NaN/空字符串
     if val is None:
@@ -109,7 +110,7 @@ class QgDatafeed(BaseDatafeed):
         end_str = req.end.strftime("%Y%m%d")
         try:
             if api_name == "stk_mins": #分钟级数据
-                freq = INTERVAL_VT2QG_FREQ[req.interval]
+                freq = _MINUTE_FREQ_OVERRIDE if (_MINUTE_FREQ_OVERRIDE and req.interval == Interval.MINUTE) else INTERVAL_VT2QG_FREQ[req.interval]
                 df = self._fetch_all(api_name, ts_code=ts_code, freq=freq, start_date=start_str, end_date=end_str,
                     fields="ts_code,trade_time,open,high,low,close,vol,amount", order_by="trade_time", sort="asc")
             elif api_name == "weekly": #周线数据
