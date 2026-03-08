@@ -222,40 +222,48 @@ def _patch_lot_compliance(engine, vt_symbols, mode):
         engine.send_order = _wrap
 
 def _patch_t1_compliance(engine, interval):
-    """A股T+1兜底：分钟/小时级回测中，当日买入的股数当日不可卖出"""
+    """A股T+1持仓模型（参考rqalpha/聚宽设计）：维护closable_pos，策略可查询可卖数量，卖出时自动调减"""
     if interval in (Interval.DAILY, Interval.WEEKLY):
-        return  #日线/周线天然隔日，无需T+1限制
-    t1 = {"today": None, "locked": 0, "t1_hits": 0}
+        return
+    t1 = {"today": None, "non_closable": 0, "stats": {"blocked": 0, "adjusted": 0, "unlocked": 0}}
     _orig_bar = engine.new_bar
     def _bar_wrap(data):
         dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
         if dt_date and dt_date != t1["today"]:
-            if t1["locked"] > 0: p(f"[T+1] 新交易日{dt_date}，解锁{t1['locked']}股昨日锁定持仓")
-            t1["today"] = dt_date; t1["locked"] = 0
+            if t1["non_closable"] > 0:
+                t1["stats"]["unlocked"] += 1
+                p(f"[T+1] 新交易日{dt_date}，解锁{t1['non_closable']}股(non_closable→0)")
+            t1["today"] = dt_date; t1["non_closable"] = 0
+            if engine.strategy: engine.strategy.closable_pos = int(engine.strategy.pos)  #日初：全部可卖
         _orig_bar(data)
+        if engine.strategy:  #每根bar更新closable_pos
+            engine.strategy.closable_pos = max(int(engine.strategy.pos) - t1["non_closable"], 0)
     engine.new_bar = _bar_wrap
     _orig_send = engine.send_order
     def _send_wrap(strategy, direction, offset, price, volume, stop, lock, net):
-        if direction == Direction.LONG:
+        if direction == Direction.LONG:  #买入：成交后增加non_closable
             result = _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
-            t1["locked"] += int(volume)
+            if result:  #有返回说明下单成功（引擎接受了委托）
+                t1["non_closable"] += int(volume)
+                strategy.closable_pos = max(int(strategy.pos) - t1["non_closable"], 0)
             return result
-        else:  #卖出：扣减当日锁定的不可卖部分
-            total_pos = int(strategy.pos)
-            sellable = max(total_pos - t1["locked"], 0)
+        else:  #卖出：基于closable_pos调减，而非静默拒绝
+            closable = max(int(strategy.pos) - t1["non_closable"], 0)
             req_vol = int(volume)
-            if req_vol > sellable:
-                blocked = req_vol - sellable
-                t1["t1_hits"] += 1
-                if sellable > 0:
-                    p(f"[T+1] 卖出{req_vol}股→实际可卖{sellable}股(锁定{t1['locked']}股当日买入)")
-                    return _orig_send(strategy, direction, offset, price, sellable, stop, lock, net)
-                else:
-                    p(f"[T+1] 卖出{req_vol}股被拦截：全部{total_pos}股均为当日买入(锁定{t1['locked']})")
-                    return []
-            return _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
+            if req_vol <= closable:
+                return _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
+            elif closable > 0:  #部分可卖：只卖可卖部分，日志透明
+                t1["stats"]["adjusted"] += 1
+                p(f"[T+1] 卖出{req_vol}→调减为{closable}股(non_closable={t1['non_closable']})")
+                return _orig_send(strategy, direction, offset, price, closable, stop, lock, net)
+            else:  #全部锁定：完全无法卖出
+                t1["stats"]["blocked"] += 1
+                p(f"[T+1] 卖出{req_vol}股跳过：可卖0股(全部{int(strategy.pos)}股为当日买入)")
+                return []
     engine.send_order = _send_wrap
-    p(f"[T+1] A股T+1合规兜底已启用(分钟级回测)")
+    if engine.strategy:
+        engine.strategy.closable_pos = 0  #初始化属性
+    p(f"[T+1] A股T+1持仓模型已启用(closable_pos可查询可卖数量)")
     return t1
 
 # ========== 回测 ==========
