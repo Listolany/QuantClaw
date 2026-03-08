@@ -221,50 +221,81 @@ def _patch_lot_compliance(engine, vt_symbols, mode):
             return _orig(strategy, vt_symbol, direction, offset, price, adj, lock, net)
         engine.send_order = _wrap
 
-def _patch_t1_compliance(engine, interval):
-    """A股T+1持仓模型（参考rqalpha/聚宽设计）：维护closable_pos，策略可查询可卖数量，卖出时自动调减"""
-    if interval in (Interval.DAILY, Interval.WEEKLY):
-        return
-    t1 = {"today": None, "non_closable": 0, "stats": {"blocked": 0, "adjusted": 0, "unlocked": 0}}
+def _patch_account_model(engine, interval, capital, rate):
+    """A股账户模型（对齐rqalpha/聚宽/backtrader）：策略可查available_cash/total_value/closable_pos等"""
+    acct = {"cash": float(capital), "today": None, "non_closable": 0, "avg_cost": 0.0,
+            "last_price": 0.0, "stats": {"t1_blocked": 0, "t1_adjusted": 0, "cash_rejected": 0}}
+    is_intraday = interval not in (Interval.DAILY, Interval.WEEKLY)
+    def _inject(strategy, bar_price=0.0):
+        """每根bar更新策略的账户属性（对标聚宽context.portfolio）"""
+        pos = int(strategy.pos)
+        acct["last_price"] = bar_price if bar_price > 0 else acct["last_price"]
+        market_value = pos * acct["last_price"]
+        strategy.available_cash = acct["cash"]  #聚宽portfolio.available_cash
+        strategy.total_value = acct["cash"] + market_value  #聚宽portfolio.total_value
+        strategy.positions_value = market_value  #聚宽portfolio.positions_value
+        strategy.capital = acct["cash"]  #兼容旧代码：capital=可用现金
+        if is_intraday:
+            strategy.closable_pos = max(pos - acct["non_closable"], 0)  #聚宽position.closeable_amount
+        else:
+            strategy.closable_pos = pos
     _orig_bar = engine.new_bar
     def _bar_wrap(data):
-        dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
-        if dt_date and dt_date != t1["today"]:
-            if t1["non_closable"] > 0:
-                t1["stats"]["unlocked"] += 1
-                p(f"[T+1] 新交易日{dt_date}，解锁{t1['non_closable']}股(non_closable→0)")
-            t1["today"] = dt_date; t1["non_closable"] = 0
-            if engine.strategy: engine.strategy.closable_pos = int(engine.strategy.pos)  #日初：全部可卖
+        if is_intraday:
+            dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
+            if dt_date and dt_date != acct["today"]:
+                if acct["non_closable"] > 0:
+                    p(f"[T+1] 新交易日{dt_date}，解锁{acct['non_closable']}股")
+                acct["today"] = dt_date; acct["non_closable"] = 0
         _orig_bar(data)
-        if engine.strategy:  #每根bar更新closable_pos
-            engine.strategy.closable_pos = max(int(engine.strategy.pos) - t1["non_closable"], 0)
+        if engine.strategy: _inject(engine.strategy, float(data.close_price))
     engine.new_bar = _bar_wrap
     _orig_send = engine.send_order
     def _send_wrap(strategy, direction, offset, price, volume, stop, lock, net):
-        if direction == Direction.LONG:  #买入：成交后增加non_closable
-            result = _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
-            if result:  #有返回说明下单成功（引擎接受了委托）
-                t1["non_closable"] += int(volume)
-                strategy.closable_pos = max(int(strategy.pos) - t1["non_closable"], 0)
+        vol = int(volume); price_f = float(price)
+        if direction == Direction.LONG:  #买入
+            cost = price_f * vol * (1 + rate)
+            if cost > acct["cash"] + 0.01:  #资金不足
+                affordable = int(acct["cash"] / (price_f * (1 + rate)) / 100) * 100
+                if affordable <= 0:
+                    acct["stats"]["cash_rejected"] += 1
+                    p(f"[账户] 买入{vol}股被拒：需{cost:.0f}元，可用{acct['cash']:.0f}元")
+                    return []
+                p(f"[账户] 买入{vol}→调减为{affordable}股(可用现金{acct['cash']:.0f}元)")
+                vol = affordable
+            result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
+            if result:
+                acct["cash"] -= price_f * vol * (1 + rate)
+                if is_intraday: acct["non_closable"] += vol
+                old_pos = int(strategy.pos) - vol
+                if old_pos + vol > 0:
+                    acct["avg_cost"] = (acct["avg_cost"] * old_pos + price_f * vol) / (old_pos + vol)
+                _inject(strategy, price_f)
             return result
-        else:  #卖出：基于closable_pos调减，而非静默拒绝
-            closable = max(int(strategy.pos) - t1["non_closable"], 0)
-            req_vol = int(volume)
-            if req_vol <= closable:
-                return _orig_send(strategy, direction, offset, price, volume, stop, lock, net)
-            elif closable > 0:  #部分可卖：只卖可卖部分，日志透明
-                t1["stats"]["adjusted"] += 1
-                p(f"[T+1] 卖出{req_vol}→调减为{closable}股(non_closable={t1['non_closable']})")
-                return _orig_send(strategy, direction, offset, price, closable, stop, lock, net)
-            else:  #全部锁定：完全无法卖出
-                t1["stats"]["blocked"] += 1
-                p(f"[T+1] 卖出{req_vol}股跳过：可卖0股(全部{int(strategy.pos)}股为当日买入)")
-                return []
+        else:  #卖出
+            if is_intraday:  #T+1检查
+                closable = max(int(strategy.pos) - acct["non_closable"], 0)
+                if vol > closable:
+                    if closable > 0:
+                        acct["stats"]["t1_adjusted"] += 1
+                        p(f"[T+1] 卖出{vol}→调减为{closable}股(non_closable={acct['non_closable']})")
+                        vol = closable
+                    else:
+                        acct["stats"]["t1_blocked"] += 1
+                        p(f"[T+1] 卖出{vol}股跳过：可卖0股")
+                        return []
+            result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
+            if result:
+                acct["cash"] += price_f * vol * (1 - rate)  #卖出回款（扣佣金）
+                _inject(strategy, price_f)
+            return result
     engine.send_order = _send_wrap
     if engine.strategy:
-        engine.strategy.closable_pos = 0  #初始化属性
-    p(f"[T+1] A股T+1持仓模型已启用(closable_pos可查询可卖数量)")
-    return t1
+        _inject(engine.strategy)
+    features = ["available_cash", "total_value", "positions_value", "closable_pos", "capital"]
+    if is_intraday: features.append("T+1")
+    p(f"[账户模型] A股账户模型已启用: {', '.join(features)}")
+    return acct
 
 # ========== 回测 ==========
 def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, rate, slippage, size, pricetick, strategy_params, total_stages):
@@ -286,7 +317,7 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
         engine.add_strategy(strategy_cls, strategy_params)
     _patch_lot_compliance(engine, vt_symbols, mode)
     if mode == "cta":
-        _patch_t1_compliance(engine, interval)
+        _patch_account_model(engine, interval, capital, rate)
     if mode == "cta" and engine.strategy:
         if not hasattr(engine.strategy, 'load_bars'):
             engine.strategy.load_bars = lambda days=10, interval=None: engine.strategy.load_bar(days)  #兜底：CTA策略误用load_bars时降级为load_bar
