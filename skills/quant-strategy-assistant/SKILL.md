@@ -87,7 +87,9 @@ DEFAULT_PRICETICK = 0.01
 - `QUANTCLAW_ROOT`：项目根目录（兼容 `QMT_PROJECT_ROOT`）
 - `MONITOR_PUBLIC_BASE`：监控公网基址（可留空，由 `OPENCLAW_CONTROL_URL` 推导）
 - `ORCH_MONITOR_PORT_CANDIDATES`：白名单端口（默认 `8767`，必须在防火墙放通）
-- `QGDATA_TOKEN`：数据 Token
+- `QGDATA_TOKEN`：数据 Token（可选；未配置时自动使用内置共享试用Token，有每日额度限制）
+
+**Token 自动提取规则（强制）**：若用户对话中出现 60~70 位连续字母数字串（如"我的token是 Mj9mN2xP..."），自动提取并通过 `--token` 参数传给 submit 命令。日志和回复中只显示前 6 位+`***`，**绝不回显完整 Token**。提取到个人 Token 后提示用户：`已使用您的个人Token，不消耗共享试用额度`。
 
 ---
 
@@ -274,8 +276,10 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 
 - 执行 `submit` 前必须保证存在公网基址：优先 `MONITOR_PUBLIC_BASE`，为空时允许由 `OPENCLAW_CONTROL_URL` 自动推导。
 - 若未配置：直接返回 `status=config_missing`。
-- 建议预检 `QGDATA_TOKEN`；缺失时提示：
-  - 前往 [quantgo.ai/data](https://quantgo.ai/data) 低成本解锁 Pro Plan。
+- `QGDATA_TOKEN` 未配置时系统自动使用内置共享试用 Token（每日有限额度），无需阻断。
+- 若 submit 返回 `status=data_auth_failed`，说明数据服务额度不足或权限不够，提示用户：
+  - 前往 [quantgo.ai/data](https://quantgo.ai/data) 获取个人 Token 或升级套餐。
+  - 也可在对话中直接贴 Token（系统会自动提取）。
 
 ## 失败快照
 

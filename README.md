@@ -44,9 +44,9 @@ quant-claw/
 1. **Python 环境**：建议 `Python 3.10+`
 2. **OpenClaw 环境**（如果你要用 Skill 方式一句话触发）
 3. **LLM API Key**（给 OpenClaw 用，用于理解需求和生成策略）
-4. **qgdata Pro 权限 + Token**（用于稳定获取历史行情/财务等数据）
+4. **qgdata Token**（用于获取历史行情/财务等数据；未配置时自动使用内置共享试用Token，有每日额度限制）
 
-> 如果你暂时不接 OpenClaw，也可以只用本仓库的 Python 脚本直接回测；但要有 `QGDATA_TOKEN`。
+> 如果你暂时不接 OpenClaw，也可以只用本仓库的 Python 脚本直接回测。未配置 `QGDATA_TOKEN` 时系统使用内置共享试用 Token，可免费体验（每日有限额度）。升级获取个人 Token：[https://quantgo.ai/data](https://quantgo.ai/data)
 >
 > **回测与实盘分离**：回测基于 vnpy 引擎，**任何平台**均可运行，不依赖 QMT。支持 CTA（单标的择时）和 Portfolio（多标的组合/轮动）两种策略模式，系统根据自然语言描述自动路由。支持多种 K 线周期（日线/5分钟/15分钟/30分钟/小时线/周线），分钟级回测内置 A 股 T+1 合规兜底（当日买入不可当日卖出）。模拟盘/实盘需要 QMT 交易端，运行 `qmt-check` 可一键检测环境是否就绪。
 
@@ -56,7 +56,7 @@ quant-claw/
 - [ ] 已安装 `pip`
 - [ ] 已安装 OpenClaw（用于加载 `skills/quant-strategy-assistant`）
 - [ ] 已配置一个可用的 LLM API（OpenAI 兼容接口即可）
-- [ ] 已在 qgdata 平台开通 Pro 并拿到 `QGDATA_TOKEN`
+- [ ] 已获取 `QGDATA_TOKEN`（可选；未配置时使用内置共享试用Token）
 - [ ] 有一个可公网访问的 IP/域名（用于监控链接）
 - [ ] 安全组/防火墙放通监控白名单端口（默认 `8767`）
 - [ ] 若要模拟盘/实盘，已安装并启动 QMT 交易端（系统自动检测可用性）
@@ -81,14 +81,16 @@ pip install -e QMT-TradingClaw/vnpy_qmt
 
 不同 OpenClaw 版本配置字段可能略有差异，但核心就是 **Key + Base URL + Model** 三项。
 
-## 第三步：开通 qgdata Pro 并获取 Token
+## 第三步：配置数据 Token（可选）
 
-1. 访问 qgdata 官网并注册/登录  
-2. 开通 Pro（或包含你所需接口权限的套餐）  
-3. 在控制台获取 `token`  
-4. 用下面命令配置为环境变量 `QGDATA_TOKEN`
+系统内置共享试用 Token，**无需配置即可免费体验**（每日有限额度）。超出额度或需要更多数据能力时：
 
-> 没有 Pro 或权限不足时，常见报错会表现为数据拉取失败、接口无权限或 token 检查失败。
+1. 访问 [https://quantgo.ai/data](https://quantgo.ai/data) 注册/登录
+2. 选择适合的套餐（Free/Pro/Ultra）
+3. 在控制台获取个人 `token`
+4. 配置为环境变量 `QGDATA_TOKEN`，或在 OpenClaw 对话中直接说"我的token是 xxx"
+
+> 试用额度用完时系统会提示：`当日额度已达上限，去 quantgo.ai/data 解锁更多能力`。
 
 ## 第四步：配置环境变量
 

@@ -85,16 +85,25 @@ def read_env_value_from_files(key: str, candidates: list[Path]) -> str:
     return ""
 
 
-def resolve_qgdata_token(explicit_token: str) -> str:
-    if explicit_token:
-        return explicit_token
+def extract_token_from_chat(text: str) -> str:
+    """从用户对话文本中提取疑似qgdata token"""
+    m = QGDATA_TOKEN_RE.search(text or "")
+    return m.group(0) if m else ""
+
+def resolve_qgdata_token(explicit_token: str, chat_text: str = "") -> tuple[str, str]:
+    """解析token → (token, source)。source: user_arg|user_chat|env|shared"""
+    if explicit_token and len(explicit_token.strip()) >= 20:
+        return explicit_token.strip(), "user_arg"
+    chat_token = extract_token_from_chat(chat_text)
+    if chat_token:
+        return chat_token, "user_chat"
     env_token = os.getenv("QGDATA_TOKEN", "")
     if env_token:
-        return env_token
-    return read_env_value_from_files(
-        "QGDATA_TOKEN",
-        [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")],
-    )
+        return env_token, "env"
+    file_token = read_env_value_from_files("QGDATA_TOKEN", [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")])
+    if file_token:
+        return file_token, "env"
+    return QGDATA_SHARED_TOKEN, "shared"
 
 
 def resolve_monitor_public_base(explicit_base: str) -> str:
@@ -128,6 +137,9 @@ def resolve_monitor_public_base(explicit_base: str) -> str:
     return ""
 
 
+from qg_constants import QGDATA_RECHARGE_URL, QGDATA_SHARED_TOKEN, QGDATA_TOKEN_RE, mask_token, classify_qgdata_error
+
+
 def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], str]:
     """按中文名解析股票代码→(代码列表, 警告信息)"""
     candidates = re.findall(r"[\u4e00-\u9fff]{2,10}", requirement)
@@ -154,10 +166,9 @@ def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], st
             if s and s not in seen: seen.add(s); out.append(s)
         return out, ""
     except Exception as exc:
-        return [], f"按名称查询股票失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
+        _, user_msg = classify_qgdata_error(exc)
+        return [], f"按名称查询股票失败: {user_msg}"
 
-
-QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
 
 def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[list[str], str]:
     """解析股票池关键词→(代码列表, 警告信息)。警告非空表示关键词匹配但API失败。"""
@@ -197,7 +208,8 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
             except Exception: ts_codes = ts_codes[:cap]
         return [normalize_symbol(str(c)) for c in ts_codes], ""
     except Exception as exc:
-        return [], f"「{matched}」选股失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
+        code, user_msg = classify_qgdata_error(exc)
+        return [], f"「{matched}」选股失败: {user_msg}"
 
 def _extract_symbols_from_source(source: str) -> list[str]:
     """从策略源码提取硬编码的 vt_symbol 列表（如 '600519.SH'），用于与 parsed['symbols'] 对齐"""
@@ -214,20 +226,23 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     symbols = [normalize_symbol(s) for s in symbol_matches]
     if symbols_override:
         symbols = [normalize_symbol(s) for s in symbols_override.split(",") if s.strip()]
+    pool_api_failed = False
     if not symbols:
         name_syms, name_warn = resolve_symbols_by_name(txt, token)
         if name_syms: symbols = name_syms
-        elif name_warn: pool_warn = name_warn; print(f"[ERROR] {name_warn}")
+        elif name_warn: pool_warn = name_warn; print(f"[WARN] {name_warn}")
     if not symbols:
         pool, pw = _resolve_stock_pool(txt, token)
         if pool: symbols = pool
-        elif pw: pool_warn = pool_warn or pw; print(f"[ERROR] {pw}"); symbols = ["000001.SZSE"]
+        elif pw: pool_warn = pool_warn or pw; pool_api_failed = True; print(f"[ERROR] {pw}")
         else: symbols = ["000001.SZSE"]
+    if not symbols: symbols = ["000001.SZSE"]
 
     ma_kw = ["均线", "上穿", "下穿", "金叉", "死叉", "SMA", "sma", "EMA", "ema", "日线交叉", "移动平均"]
     is_ma = any(k in txt for k in ma_kw) or bool(re.search(r'\bMA\b(?!CD)', txt))
     result: Dict[str, Any] = {"symbols": symbols}
     if pool_warn: result["pool_warning"] = pool_warn
+    if pool_api_failed: result["data_blocked"] = True
     if is_ma:
         windows = [int(m.group(1)) for m in re.finditer(r"(\d+)\s*日", txt)]
         if len(windows) >= 2:
@@ -834,8 +849,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "error", "error": f"run_id already exists: {run_id}"}, ensure_ascii=False))
         return 1
 
-    resolved_token = resolve_qgdata_token(args.token)
+    resolved_token, token_source = resolve_qgdata_token(args.token, args.requirement)
+    print(f"[token] source={token_source}, token={mask_token(resolved_token)}")
     parsed = parse_requirement(args.requirement, args.symbols, resolved_token)
+    if parsed.get("data_blocked"):
+        print(json.dumps({"status": "data_auth_failed", "error": parsed.get("pool_warning", "数据服务不可用"), "next_action": f"请配置有效Token或到 {QGDATA_RECHARGE_URL} 充值后重试", "token_source": token_source}, ensure_ascii=False))
+        return 2
     cap = evaluate_requirement(args.requirement).to_dict()
     if not cap.get("ok", False):
         print(
@@ -911,6 +930,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "title": args.title,
         "python_bin": args.python_bin or DEFAULT_PYTHON_BIN,
         "qgdata_token_present": bool(resolved_token),
+        "qgdata_token_source": token_source,
         "timeout_sec": args.timeout_sec,
         "strategy_file": strategy_file,
         "strategy_module": strategy_module,
@@ -968,6 +988,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     worker_env = os.environ.copy()
     if resolved_token:
         worker_env["QGDATA_TOKEN"] = resolved_token
+        worker_env["QGDATA_TOKEN_SOURCE"] = token_source
     worker_proc = start_process(worker_cmd, store.run_log, env=worker_env)
     state["process"]["worker_pid"] = worker_proc.pid
     state["status"] = "running"
@@ -986,6 +1007,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "report_summary_url": report_summary_url,
         "state_file": str(store.state_file),
         "worker_pid": worker_proc.pid,
+        "token_source": token_source,
     }
     if parsed.get("pool_warning"): submit_result["pool_warning"] = parsed["pool_warning"]
     print(json.dumps(submit_result, ensure_ascii=False))
@@ -993,7 +1015,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    qgdata_token = os.getenv("QGDATA_TOKEN", "") or resolve_qgdata_token("")
+    qgdata_token = os.getenv("QGDATA_TOKEN", "") or resolve_qgdata_token("")[0]
     store = RunStore(args.run_id)
     state = store.load()
     payload = state["payload"]
@@ -1380,7 +1402,7 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
     else:
         _warn("端口公网可达", ports_raw, "需先修复 MONITOR_PUBLIC_BASE 才能测试端口连通性")
 
-    token = resolve_qgdata_token("")
+    token, token_src = resolve_qgdata_token("")
     token_ok = bool(token)
     if token_ok:
         try:
@@ -1389,9 +1411,9 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
             pro = qg.pro_api(timeout=5.0)
             df = pro.stock_basic(exchange="", list_status="L", fields="ts_code", limit=1)
             token_ok = df is not None and len(df) > 0
-            _check("QGDATA_TOKEN", token_ok, token[:6] + "***", "Token 校验通过" if token_ok else f"Token 无效或接口无权限，请到 {QGDATA_RECHARGE_URL} 确认套餐或充值")
+            _check("QGDATA_TOKEN", token_ok, f"{mask_token(token)}(来源:{token_src})", "Token 校验通过" if token_ok else f"Token 无效或接口无权限，请到 {QGDATA_RECHARGE_URL} 确认套餐或充值")
         except Exception as e:
-            _check("QGDATA_TOKEN", False, token[:6] + "***", f"Token 校验异常: {e}。充值/获取: {QGDATA_RECHARGE_URL}")
+            _check("QGDATA_TOKEN", False, f"{mask_token(token)}(来源:{token_src})", f"Token 校验异常: {e}。充值/获取: {QGDATA_RECHARGE_URL}")
     else:
         _check("QGDATA_TOKEN", False, "", f"未配置，前往 {QGDATA_RECHARGE_URL} 获取")
 
@@ -1479,7 +1501,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         from vnpy.trader.optimize import OptimizationSetting
         from vnpy.trader.constant import Interval
         from vnpy.trader.setting import SETTINGS
-        qgdata_token = os.getenv("QGDATA_TOKEN", "") or resolve_qgdata_token("")
+        qgdata_token = os.getenv("QGDATA_TOKEN", "") or resolve_qgdata_token("")[0]
         if qgdata_token:
             SETTINGS["datafeed.name"] = "qg"
             SETTINGS["datafeed.password"] = qgdata_token

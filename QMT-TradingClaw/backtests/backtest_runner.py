@@ -18,8 +18,9 @@ from vnpy.trader.setting import SETTINGS
 from vnpy_xt.qg_datafeed import QgDatafeed
 
 BASE = str((PROJECT_ROOT / "backtests").resolve())
+sys.path.insert(0, BASE)
 LOCK = os.path.join(BASE, ".run_lock")
-QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
+from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error, mask_token
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 MONITOR = ""  # http://127.0.0.1:port（启用时设置）
 
@@ -84,8 +85,9 @@ def validate_token(token, total_stages):
         pro.daily(ts_code="000001.SZ", start_date="20250101", end_date="20250110")
         stage(1, total_stages, "success", "qgdata token检查通过")
     except Exception as e:
-        stage(1, total_stages, "failed", f"qgdata token检查失败: {type(e).__name__}")
-        p(f"  可能原因: token无效/额度用尽/网络异常\n  充值/获取Token: {QGDATA_RECHARGE_URL}\n  错误: {str(e)[:160]}"); sys.exit(1)
+        code, user_msg = classify_qgdata_error(e)
+        stage(1, total_stages, "failed", f"qgdata token检查失败: {code}")
+        p(f"  {user_msg}"); sys.exit(1)
 
 def _bar(done, total, w=24):
     if total <= 0: return "[" + "-" * w + "]"
@@ -444,7 +446,8 @@ def _load_trade_calendar(start, end):
         p(f"[日历] 交易日历已加载: {len(cal)}个交易日")
         return cal
     except Exception as ex:
-        p(f"[日历] 交易日历加载失败({ex})，策略将无法使用trade_calendar。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+        _, user_msg = classify_qgdata_error(ex)
+        p(f"[日历] 交易日历加载失败: {user_msg}")
         return set()
 
 def _vn2qg(vt_symbol):
@@ -513,7 +516,8 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
                         if not warned["suspend"]: p(f"[guard-warn] 停牌日历加载异常({ex})，降级为不拦截停牌单"); warned["suspend"] = True
                 p(f"[guard] 停牌日历逐标的加载完成: {len(suspend_set)}条")
         except Exception as ex:
-            p(f"[guard-warn] qgdata初始化失败({ex})，停牌/涨跌停守卫降级。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+            _, user_msg = classify_qgdata_error(ex)
+            p(f"[guard-warn] qgdata初始化失败，停牌/涨跌停守卫降级: {user_msg}")
     else:
         p(f"[guard-warn] 未配置QGDATA_TOKEN，停牌/涨跌停守卫降级。获取Token: {QGDATA_RECHARGE_URL}")
     def _load_limits_for_day(date_s, symbols):

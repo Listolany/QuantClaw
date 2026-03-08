@@ -60,7 +60,7 @@ KEYWORD_API_RULES: Dict[str, List[str]] = {
 }
 
 # Keywords that usually imply out-of-scope or ambiguous requirement.
-QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
+from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error
 
 UNSUPPORTED_HINTS: Dict[str, str] = {
     "期权": "当前编排器默认股票策略，期权需要单独执行链路。",
@@ -74,7 +74,7 @@ def list_runtime_apis() -> tuple[Set[str], str]:
     """返回 (可用API集合, 警告信息)。警告非空表示Token问题。"""
     token = os.getenv("QGDATA_TOKEN", "")
     if not token:
-        return set(), f"未配置QGDATA_TOKEN，数据能力检查将使用文档声明的API列表。获取Token: {QGDATA_RECHARGE_URL}"
+        return set(), f"未配置QGDATA_TOKEN，使用文档声明的API列表。获取Token: {QGDATA_RECHARGE_URL}"
     try:
         import qgdata as qg  # type: ignore
         qg.set_token(token)
@@ -85,7 +85,8 @@ def list_runtime_apis() -> tuple[Set[str], str]:
         if isinstance(apis, dict):
             return {str(k) for k in apis.keys()}, ""
     except Exception as exc:
-        return set(), f"qgdata API能力探测失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
+        _, user_msg = classify_qgdata_error(exc)
+        return set(), f"qgdata API能力探测失败: {user_msg}"
     return set(), ""
 
 

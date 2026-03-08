@@ -11,7 +11,11 @@ from vnpy.trader.datafeed import BaseDatafeed
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 GATEWAY_NAME = "QG"
-QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
+try:
+    from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error
+except ImportError:
+    import sys as _sys, os as _os; _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "backtests"))
+    from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error
 PAGE_SIZE = 5000 #qgdata单次最大返回条数
 
 EXCHANGE_VT2QG: dict[Exchange, str] = { #VeighNa交易所 -> qgdata后缀(仅A股市场)
@@ -74,10 +78,11 @@ class QgDatafeed(BaseDatafeed):
             self.pro = qg.pro_api(timeout=30.0)
             df = self.pro.trade_cal(exchange="SSE", limit=1) #验证连接
             if df is None or df.empty:
-                output(f"qgdata数据服务初始化失败：连接验证未通过，可能Token无效或额度不足。充值地址: {QGDATA_RECHARGE_URL}")
+                output(f"qgdata数据服务初始化失败：连接验证未通过。充值/获取Token: {QGDATA_RECHARGE_URL}")
                 return False
         except Exception as ex:
-            output(f"qgdata数据服务初始化失败({type(ex).__name__}: {ex})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+            _, user_msg = classify_qgdata_error(ex)
+            output(f"qgdata数据服务初始化失败: {user_msg}")
             return False
         self.inited = True
         return True
@@ -121,7 +126,8 @@ class QgDatafeed(BaseDatafeed):
                 df = self._fetch_all(api_name, ts_code=ts_code, start_date=start_str, end_date=end_str,
                     fields="ts_code,trade_date,open,high,low,close,vol,amount,pre_close,change", order_by="trade_date", sort="asc")
         except Exception as ex:
-            output(f"qgdata查询历史数据异常({type(ex).__name__}: {ex})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+            _, user_msg = classify_qgdata_error(ex)
+            output(f"qgdata查询历史数据异常: {user_msg}")
             return history
         if df is None or df.empty:
             return history
