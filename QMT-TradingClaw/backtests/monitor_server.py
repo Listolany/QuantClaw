@@ -41,10 +41,10 @@ def broadcast(event, data):
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>策略监控</title>
-<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+<script defer src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
 <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/styles/atom-one-light.min.css" onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css'">
-<script src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/highlight.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
-<script src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/languages/python.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
+<script defer src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/highlight.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
+<script defer src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/languages/python.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(180deg,#e8f4f8,#f0f9ff);min-height:100vh;color:#1e293b}
@@ -195,7 +195,13 @@ function setTL(n,st){
 }
 function addLog(m){const e=document.getElementById('logs');const ml=m.replace(/(https?:\\/\\/[^\\s<]+)/g,'<a href="$1" target="_blank" style="color:#2563eb">$1</a>');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+ml+'</div>';e.scrollTop=e.scrollHeight}
 let chart=null,dailyChart=null;
-try{chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'})}catch(e){addLog('⚠️ 图表库加载失败('+e.message+')，数据正常推送中');}
+function _initCharts(){
+  if(chart)return;
+  if(typeof echarts==='undefined'){setTimeout(_initCharts,500);return}
+  try{chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
+    if(chart)chart.setOption(chartOpt);if(dailyChart)dailyChart.setOption(dailyOpt);addLog('📈 图表库加载完成')}catch(e){addLog('⚠️ 图表库初始化失败('+e.message+')')}
+}
+setTimeout(_initCharts,100);
 const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',
   tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14],shadowBlur:8,shadowColor:'rgba(0,0,0,.1)',formatter:function(ps){var h=ps[0].axisValue;ps.forEach(function(p){if(p.value!=null){h+='<br/>'+p.marker+p.seriesName+': '+p.value.toFixed(4)+' <b>('+((p.value-1)*100).toFixed(2)+'%)</b>'}});return h}},
   legend:{data:['策略净值','沪深 300 基准'],top:10,right:16,textStyle:{color:'#64748b',fontSize:12}},
@@ -206,14 +212,12 @@ const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',
     {name:'策略净值',type:'line',data:[],smooth:.25,lineStyle:{width:3,color:'#2563eb'},areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(37,99,235,.15)'},{offset:1,color:'rgba(37,99,235,0)'}]}},symbol:'none',symbolSize:6},
     {name:'沪深 300 基准',type:'line',data:[],smooth:.25,lineStyle:{width:2,color:'#dc2626',type:'dashed'},symbol:'none'}
   ]};
-if(chart)chart.setOption(chartOpt);
 const dailyOpt={animation:true,animationDuration:300,
   tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14]},
   grid:{left:56,right:24,top:36,bottom:48},
   xAxis:{type:'category',data:[],axisLabel:{color:'#94a3b8',fontSize:10},axisLine:{lineStyle:{color:'#e2e8f0'}}},
   yAxis:{type:'value',name:'日收益%',nameTextStyle:{color:'#64748b'},axisLabel:{color:'#64748b',fontSize:11,formatter:v=>v.toFixed(2)+'%'},axisLine:{lineStyle:{color:'#e2e8f0'}},splitLine:{lineStyle:{color:'#f1f5f9'}}},
   series:[{name:'日收益',type:'bar',data:[],itemStyle:{color:function(p){return p.data>=0?'#16a34a':'#dc2626'}},barWidth:'60%',showBackground:true,backgroundStyle:{color:'rgba(0,0,0,.02)'}}]};
-if(dailyChart)dailyChart.setOption(dailyOpt);
 window.addEventListener('resize',()=>{if(chart)chart.resize();if(dailyChart)dailyChart.resize()});
 var STATE_DONE=false;
 let dateIdx={},tradeData=[],currentPage=1,pageSize=10;
@@ -394,7 +398,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path; qs = parse_qs(urlparse(self.path).query)
         if path == "/" or path.startswith("/runs/"):
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store"); self.end_headers()
             self.wfile.write(HTML_PAGE.encode())
         elif path == "/api/sse" or path == "/events":
             self.send_response(200)
