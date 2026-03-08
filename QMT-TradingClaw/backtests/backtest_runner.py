@@ -869,7 +869,14 @@ def main():
     start = datetime.strptime(args.start, _dfmt); end = datetime.strptime(args.end, _dfmt)
     strategy_params = json.loads(args.params)
     title = args.title or f"{','.join(vt_symbols[:3])} 回测净值曲线"
-    symbols_exchanges = [(s.split(".")[0], Exchange(s.split(".")[1])) for s in vt_symbols]
+    symbols_exchanges, _bad = [], []
+    for s in vt_symbols:
+        sym, ex_str = s.split(".")[0], s.split(".")[1]
+        try: symbols_exchanges.append((sym, Exchange(ex_str)))
+        except ValueError: _bad.append(s); p(f"  [warn] 跳过不支持的交易所: {s}")
+    if _bad:
+        vt_symbols = [s for s in vt_symbols if s not in _bad]
+        p(f"  [warn] 已过滤{len(_bad)}个不支持的标的，剩余{len(vt_symbols)}个")
     mod = importlib.import_module(args.strategy)
     if hasattr(mod, args.cls): strategy_cls = getattr(mod, args.cls)
     else: # 大小写模糊匹配（agent常把Ma写成MA）

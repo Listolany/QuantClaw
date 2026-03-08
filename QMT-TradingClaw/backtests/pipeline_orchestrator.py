@@ -14,12 +14,17 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.error import URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+try:
+    from dateutil.relativedelta import relativedelta
+except ImportError:
+    relativedelta = None  # type: ignore[assignment,misc]
 
 from data_capability_guard import evaluate_requirement
 
@@ -57,14 +62,11 @@ def read_json(path: Path) -> Dict[str, Any]:
 def normalize_symbol(raw: str) -> str:
     val = raw.strip().upper()
     if re.fullmatch(r"\d{6}", val):
-        # Mainland A-share shorthand: 6xxxxx -> SSE, others -> SZSE
-        return f"{val}.SSE" if val.startswith("6") else f"{val}.SZSE"
-    if val.endswith(".SS"):
-        return val[:-3] + ".SSE"
-    if val.endswith(".SZ"):
-        return val.replace(".SZ", ".SZSE")
-    if val.endswith(".SH"):
-        return val.replace(".SH", ".SSE")
+        if val.startswith("6") or val.startswith("900"): return f"{val}.SSE" #沪市主板+B股
+        if val.startswith(("83", "43", "87", "920")): return f"{val}.BSE" #北交所
+        return f"{val}.SZSE"
+    for old, new in {".SH": ".SSE", ".SS": ".SSE", ".SZ": ".SZSE", ".BJ": ".BSE"}.items():
+        if val.endswith(old): return val[:-len(old)] + new
     return val
 
 
@@ -170,11 +172,247 @@ def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], st
         return [], f"按名称查询股票失败: {user_msg}"
 
 
+# ─── 板块/指数/概念 静态映射（全部经 pro.ths_index() 实际查询验证） ───
+THS_SECTOR_MAP: dict[str, str] = {
+    "人工智能": "885728.TI", "新能源汽车": "885431.TI", "芯片": "885756.TI",
+    "光伏": "885531.TI", "锂电池": "885710.TI", "白酒": "885525.TI",
+    "军工": "885700.TI", "数字经济": "885976.TI", "机器人": "885517.TI",
+    "储能": "885921.TI", "消费电子": "885800.TI", "华为概念": "885806.TI",
+    "鸿蒙": "885923.TI", "ChatGPT": "886031.TI", "AIGC": "886019.TI",
+    "6G": "886037.TI", "物联网": "885312.TI", "元宇宙": "885934.TI",
+    "氢能源": "885823.TI", "碳中和": "885919.TI", "工业母机": "885930.TI",
+    "特高压": "885425.TI", "充电桩": "885461.TI", "无人驾驶": "885736.TI",
+    "智能穿戴": "885454.TI", "信创": "886013.TI", "低空经济": "886067.TI",
+    "飞行汽车": "886066.TI", "数据要素": "886041.TI", "量子科技": "885730.TI",
+    "算力": "885957.TI",
+    "银行": "881155.TI", "券商": "881157.TI", "保险": "881156.TI",
+    "房地产": "881153.TI", "钢铁": "881112.TI", "煤炭": "881105.TI",
+    "建材": "881115.TI", "化工": "881109.TI", "电力": "881145.TI",
+    "石油": "881180.TI", "水泥": "884060.TI", "农业": "881101.TI",
+    "医疗": "881175.TI", "家电": "881131.TI", "纺织服装": "881136.TI",
+    "传媒": "881164.TI", "计算机": "881130.TI", "通信": "881129.TI",
+    "汽车": "881125.TI", "汽车零部件": "881126.TI", "机械": "881117.TI",
+    "建筑": "881116.TI", "零售": "881158.TI", "社会服务": "881179.TI",
+    "综合": "881165.TI", "环保": "881181.TI", "半导体": "881121.TI",
+    "沪深300": "883300.TI", "中证500": "883304.TI", "上证50": "883301.TI",
+}
+THS_SECTOR_ALIASES: dict[str, str] = { #同义词→标准关键词
+    "新能源": "新能源汽车", "医药": "医疗", "量子计算": "量子科技",
+    "食品饮料": "白酒", "证券": "券商", "eVTOL": "飞行汽车",
+    "东数西算": "算力", "第三代半导体": "半导体",
+}
+_SECTOR_KEYS_DESC = sorted(list(THS_SECTOR_MAP.keys()) + list(THS_SECTOR_ALIASES.keys()), key=len, reverse=True) #按长度降序，最长优先匹配
+INDEX_KW_MAP: dict[str, dict] = { #指数成分股双路径映射
+    "沪深300": {"ths": "883300.TI", "em_code": "000300", "approx": 300},
+    "中证500": {"ths": "883304.TI", "em_code": "000905", "approx": 500},
+    "上证50":  {"ths": "883301.TI", "em_code": "000016", "approx": 50},
+    "中证1000": {"ths": None, "em_code": "000852", "approx": 1000},
+    "创业板指": {"ths": None, "em_code": "399006", "approx": 100},
+}
+_SECTOR_CACHE_DIR = BACKTESTS_DIR / ".sector_cache"
+_SECTOR_SUFFIX_RE = re.compile(r"([\u4e00-\u9fa5A-Za-z0-9]{2,8})(板块|行业|概念|主题|赛道|题材|成分股)")
+_SECTOR_CONTEXT_RE = re.compile(r"(?:板块|行业|概念|主题|赛道|题材|成分股|股|选股|轮动|龙头|指数)") #2字符key需后跟此上下文
+_SECTOR_EXCLUDE_WORDS = re.compile(r"^(?:一个|这个|那个|某个|每个|各个|整个|全部|所有|多个|最近|过去|设计|做一个|选一个|找一个|每天|每周|每月|本月|本周|本季|今年|去年|回测|策略)")
+_SECTOR_ONLY_DIGITS_RE = re.compile(r"^[\d.]+$")
+
+
+def _sector_cache_read(code: str) -> list[str] | None:
+    """读取按日缓存的板块成分股，None=无缓存"""
+    _SECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    today_str = date.today().strftime("%Y%m%d")
+    cache_file = _SECTOR_CACHE_DIR / f"{code}_{today_str}.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text("utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _sector_cache_write(code: str, symbols: list[str]) -> None:
+    """写入按日缓存，同时清理过期文件（保留最近3天）"""
+    _SECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    today_str = date.today().strftime("%Y%m%d")
+    cache_file = _SECTOR_CACHE_DIR / f"{code}_{today_str}.json"
+    try:
+        cache_file.write_text(json.dumps(symbols, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    try: #清理3天前的缓存
+        cutoff = (date.today() - timedelta(days=3)).strftime("%Y%m%d")
+        for f in _SECTOR_CACHE_DIR.glob(f"{code}_*.json"):
+            d = f.stem.split("_")[-1]
+            if d < cutoff:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _ths_member_symbols(ts_code: str, token: str) -> list[str]:
+    """调用 ths_member 获取成分股代码列表（已 normalize）"""
+    import qgdata as qg
+    qg.set_token(token); pro = qg.pro_api(timeout=15)
+    df = pro.ths_member(ts_code=ts_code, fields="ts_code,con_code,con_name,is_new")
+    if df is None or df.empty:
+        return []
+    active = df[df["is_new"] == "Y"] if "is_new" in df.columns and not df[df["is_new"] == "Y"].empty else df
+    return [normalize_symbol(str(c)) for c in active["con_code"].tolist() if c]
+
+
+def _resolve_index_members_em(index_code: str) -> list[str]:
+    """东方财富公开API获取指数成分股（降级路径，无额度限制）"""
+    all_codes: list[str] = []; page = 1
+    while True:
+        url = (
+            f"https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            f"reportName=RPT_INDEX_COMPONENT&columns=SECURITY_CODE%2CINDEX_CODE"
+            f"&filter=%28INDEX_CODE%3D%22{index_code}%22%29"
+            f"&pageSize=500&pageNumber={page}&sortColumns=SECURITY_CODE&sortTypes=1"
+        )
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        result = body.get("result") or {}
+        rows = result.get("data") or []
+        for r in rows:
+            sc = str(r.get("SECURITY_CODE", "")).zfill(6)
+            suffix = "SSE" if sc.startswith("6") else "SZSE"
+            all_codes.append(f"{sc}.{suffix}")
+        total_pages = result.get("pages", 1)
+        if page >= total_pages:
+            break
+        page += 1
+    return all_codes
+
+
+def _resolve_index_members(kw: str, info: dict, token: str) -> tuple[list[str], str]:
+    """指数成分股双路径：ths_member主 → 东方财富降级"""
+    ths_code, em_code = info.get("ths"), info["em_code"]
+    cached = _sector_cache_read(ths_code or em_code)
+    if cached:
+        print(f"[pool] 指数「{kw}」成分股命中缓存({len(cached)}只)")
+        return cached, ""
+    if ths_code and token: #主路径
+        try:
+            syms = _ths_member_symbols(ths_code, token)
+            if syms:
+                _sector_cache_write(ths_code, syms)
+                print(f"[pool] 指数「{kw}」→ths_member({ths_code})={len(syms)}只")
+                return syms, ""
+        except Exception as e:
+            code, msg = classify_qgdata_error(e)
+            print(f"[WARN] 指数「{kw}」ths_member失败({code}): {msg}，降级到公开接口")
+    try: #降级路径
+        syms = _resolve_index_members_em(em_code)
+        if syms:
+            _sector_cache_write(ths_code or em_code, syms)
+            print(f"[pool] 指数「{kw}」→东方财富公开API={len(syms)}只")
+            return syms, ""
+        return [], f"指数「{kw}」成分股获取为空"
+    except Exception as e:
+        return [], f"指数「{kw}」成分股获取失败: {e}"
+
+
+def _extract_sector_name(txt: str) -> str | None:
+    """从需求文本提取板块/行业/概念关键词，最长匹配优先"""
+    txt_norm = re.sub(r"\s+", "", txt)
+    for key in _SECTOR_KEYS_DESC: #步骤1：静态映射key+别名key最长子串匹配
+        if key not in txt_norm:
+            continue
+        if len(key) <= 2: #2字符短key需后跟板块上下文词，防止"综合表现"误匹配"综合"行业
+            idx = txt_norm.index(key) + len(key)
+            after = txt_norm[idx:idx + 4] if idx < len(txt_norm) else ""
+            if not _SECTOR_CONTEXT_RE.match(after):
+                continue
+        return THS_SECTOR_ALIASES.get(key, key)
+    m = _SECTOR_SUFFIX_RE.search(txt_norm) #步骤2：正则提取带后缀的板块名
+    if m:
+        name = m.group(1)
+        if len(name) < 2 or _SECTOR_EXCLUDE_WORDS.match(name) or _SECTOR_ONLY_DIGITS_RE.match(name):
+            return None
+        canonical = THS_SECTOR_ALIASES.get(name, name)
+        if canonical in THS_SECTOR_MAP:
+            return canonical
+        return name #可能需要API模糊搜索
+    return None
+
+
+def _resolve_sector_members(sector_name: str, token: str) -> tuple[list[str], str]:
+    """板块/行业/概念成分股解析：静态映射→缓存→API模糊搜索"""
+    ts_code = THS_SECTOR_MAP.get(sector_name)
+    if ts_code: #静态映射命中
+        cached = _sector_cache_read(ts_code)
+        if cached:
+            print(f"[pool] 板块「{sector_name}」命中缓存({len(cached)}只)")
+            return cached, ""
+        if not token:
+            return [], f"检测到「{sector_name}」板块但未配置数据Token。请到 {QGDATA_RECHARGE_URL} 获取Token"
+        try:
+            syms = _ths_member_symbols(ts_code, token)
+            if syms:
+                _sector_cache_write(ts_code, syms)
+                print(f"[pool] 板块「{sector_name}」→ths_member({ts_code})={len(syms)}只")
+                return syms, ""
+            return [], f"板块「{sector_name}」({ts_code})成分股为空"
+        except Exception as e:
+            code, msg = classify_qgdata_error(e)
+            return [], f"板块「{sector_name}」获取失败: {msg}"
+    if not token: #API模糊搜索需要token
+        return [], f"检测到「{sector_name}」板块但未配置数据Token。请到 {QGDATA_RECHARGE_URL} 获取Token"
+    try: #静态映射未命中→API模糊搜索
+        import qgdata as qg
+        qg.set_token(token); pro = qg.pro_api(timeout=15)
+        best_code, best_name = None, None
+        for tp in ("N", "I"):
+            df = pro.ths_index(exchange="A", type=tp, fields="ts_code,name")
+            if df is None or df.empty:
+                continue
+            exact = df[df["name"] == sector_name]
+            if not exact.empty:
+                best_code = str(exact.iloc[0]["ts_code"]); best_name = str(exact.iloc[0]["name"]); break
+            contains = df[df["name"].str.contains(sector_name, na=False)]
+            if not contains.empty and best_code is None:
+                best_code = str(contains.iloc[0]["ts_code"]); best_name = str(contains.iloc[0]["name"])
+        if not best_code:
+            return [], ""
+        syms = _ths_member_symbols(best_code, token)
+        if syms:
+            _sector_cache_write(best_code, syms)
+            print(f"[pool] 板块「{sector_name}」→API搜索到「{best_name}」({best_code})={len(syms)}只")
+        return syms, ""
+    except Exception as e:
+        code, msg = classify_qgdata_error(e)
+        return [], f"板块「{sector_name}」搜索失败: {msg}"
+
+
+_BSE_KW_RE = re.compile(r"北交所|北证|BSE|北京证券交易所", re.IGNORECASE) #北交所关键词
+
+def _filter_bse(syms: list[str], txt: str) -> tuple[list[str], int]:
+    """用户未提及北交所时剔除.BSE/.BJ标的→(过滤后列表, 剔除数)"""
+    if _BSE_KW_RE.search(txt): return syms, 0
+    kept = [s for s in syms if not s.endswith((".BSE", ".BJ"))]
+    return kept, len(syms) - len(kept)
+
 def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[list[str], str]:
-    """解析股票池关键词→(代码列表, 警告信息)。警告非空表示关键词匹配但API失败。"""
-    pool_kw = {"全市场": "", "沪深主板": "主板", "创业板": "创业板", "科创板": "科创板", "沪深300": "主板", "中证500": "主板"}
-    matched = ""; txt_norm = re.sub(r"\s+", "", txt)
-    for kw, market_filter in pool_kw.items():
+    """统一股票池解析入口→(代码列表, 警告信息)。优先级：指数→板块→全市场关键词"""
+    txt_norm = re.sub(r"\s+", "", txt)
+    for kw, info in INDEX_KW_MAP.items(): #第1级：指数关键词
+        if kw in txt_norm:
+            syms, warn = _resolve_index_members(kw, info, token)
+            if syms or warn:
+                syms, n_bse = _filter_bse(syms, txt)
+                if n_bse: warn = (warn + f" " if warn else "") + f"(已剔除{n_bse}只北交所标的，需开通北交所权限请明确指定)"
+                return syms, warn
+    sector_name = _extract_sector_name(txt) #第2级：板块/行业/概念
+    if sector_name and sector_name not in INDEX_KW_MAP:
+        syms, warn = _resolve_sector_members(sector_name, token)
+        if syms or warn:
+            syms, n_bse = _filter_bse(syms, txt)
+            if n_bse: warn = (warn + f" " if warn else "") + f"(已剔除{n_bse}只北交所标的，需开通北交所权限请明确指定)"
+            return syms, warn
+    pool_kw = {"全市场": "", "沪深主板": "主板", "创业板": "创业板", "科创板": "科创板"} #第3级：市场关键词
+    matched = ""
+    for kw in pool_kw:
         if kw in txt_norm:
             matched = kw; break
     if not matched:
@@ -189,16 +427,15 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
             return [], f"「{matched}」选股：qgdata API 返回空数据，可能Token额度不足。充值地址: {QGDATA_RECHARGE_URL}"
         if matched == "科创板": df = df[df["market"] == "科创板"]
         elif matched == "创业板": df = df[df["market"] == "创业板"]
-        elif matched in ("全市场", "沪深300", "中证500", "沪深主板"): df = df[df["market"].isin(["主板", "创业板"])]
+        else: df = df[df["market"].isin(["主板", "创业板"])]
         try: cap = max(1, int(os.getenv("QC_POOL_MAX_STOCKS", str(max_stocks)) or max_stocks))
         except Exception: cap = max_stocks
         ts_codes = df["ts_code"].tolist()
         if len(ts_codes) > cap:
             try:
-                from datetime import datetime as _dt, timedelta as _td
                 mv = None
                 for i in range(7):
-                    mv = pro.daily_basic(trade_date=(_dt.now() - _td(days=i)).strftime("%Y%m%d"), fields="ts_code,total_mv")
+                    mv = pro.daily_basic(trade_date=(datetime.now() - timedelta(days=i)).strftime("%Y%m%d"), fields="ts_code,total_mv")
                     if mv is not None and not mv.empty: break
                 if mv is not None and not mv.empty:
                     mv = mv.drop_duplicates("ts_code").set_index("ts_code")
@@ -206,10 +443,98 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
                     ts_codes = df.sort_values("_mv", ascending=False, na_position="last")["ts_code"].head(cap).tolist()
                 else: ts_codes = ts_codes[:cap]
             except Exception: ts_codes = ts_codes[:cap]
-        return [normalize_symbol(str(c)) for c in ts_codes], ""
+        syms = [normalize_symbol(str(c)) for c in ts_codes]
+        syms, n_bse = _filter_bse(syms, txt)
+        bse_msg = f"(已剔除{n_bse}只北交所标的，需开通北交所权限请明确指定)" if n_bse else ""
+        return syms, bse_msg
     except Exception as exc:
         code, user_msg = classify_qgdata_error(exc)
         return [], f"「{matched}」选股失败: {user_msg}"
+
+# ─── 日期关键词解析（双保险第二层：正则兜底） ───
+_CN_NUM: dict[str, float] = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "半": 0.5}
+_CN_NUM_RE = re.compile("|".join(re.escape(k) for k in _CN_NUM))
+
+
+def _cn_to_num(txt: str) -> str:
+    """将中文数字替换为阿拉伯数字，'半'→'0.5'"""
+    return _CN_NUM_RE.sub(lambda m: str(_CN_NUM[m.group()]), txt)
+
+
+def _parse_date_range(txt: str) -> tuple[str, str] | None:
+    """从需求文本提取日期范围→("YYYYMMDD","YYYYMMDD") 或 None"""
+    today = date.today()
+    t = _cn_to_num(re.sub(r"\s+", "", txt))
+    fmt = lambda d: d.strftime("%Y%m%d")  # noqa: E731
+    def _sub_months(d: date, n: int) -> date:
+        if relativedelta:
+            return d - relativedelta(months=n)
+        return d - timedelta(days=n * 30)
+    def _sub_years(d: date, n: int) -> date:
+        if relativedelta:
+            return d - relativedelta(years=n)
+        return d - timedelta(days=n * 365)
+    m = re.search(r"(\d{8})\s*[-~至到]\s*(\d{8})", t) #P1: YYYYMMDD-YYYYMMDD
+    if m:
+        try:
+            s = datetime.strptime(m.group(1), "%Y%m%d").date()
+            e = datetime.strptime(m.group(2), "%Y%m%d").date()
+            return fmt(s), fmt(e)
+        except ValueError:
+            pass
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})\s*[-~至到]\s*(\d{4})-(\d{1,2})-(\d{1,2})", txt) #P1b: YYYY-MM-DD ~ YYYY-MM-DD
+    if m:
+        try:
+            s = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            e = date(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+            return fmt(s), fmt(e)
+        except ValueError:
+            pass
+    m = re.search(r"从?(\d{4})年(\d{1,2})月.*?[到至](\d{4})年(\d{1,2})月", t) #P2: 从YYYY年M月到YYYY年M月
+    if m:
+        try:
+            s = date(int(m.group(1)), int(m.group(2)), 1)
+            e_y, e_m = int(m.group(3)), int(m.group(4))
+            if e_m == 12: e = date(e_y, 12, 31)
+            else: e = date(e_y, e_m + 1, 1) - timedelta(days=1)
+            return fmt(s), fmt(e)
+        except ValueError:
+            pass
+    m = re.search(r"(\d{4})年以来", t) #P3: YYYY年以来
+    if m:
+        return fmt(date(int(m.group(1)), 1, 1)), fmt(today)
+    if "今年以来" in t: #P4
+        return fmt(date(today.year, 1, 1)), fmt(today)
+    if "去年以来" in t: #P5
+        return fmt(date(today.year - 1, 1, 1)), fmt(today)
+    if "本月以来" in t: #P6
+        return fmt(today.replace(day=1)), fmt(today)
+    if "本季度以来" in t: #P7
+        q_month = ((today.month - 1) // 3) * 3 + 1
+        return fmt(date(today.year, q_month, 1)), fmt(today)
+    m = re.search(r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*年0\.5", t) #P13: 最近N年半（'半'已被_cn_to_num转为0.5）
+    if m:
+        n = float(m.group(1))
+        return fmt(_sub_months(today, int(n * 12 + 6))), fmt(today)
+    m = re.search(r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*年", t) #P8: 最近N年
+    if m:
+        n = float(m.group(1))
+        if n == 0.5:
+            return fmt(_sub_months(today, 6)), fmt(today)
+        return fmt(_sub_years(today, int(n))), fmt(today)
+    m = re.search(r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*(?:个月|月)", t) #P9: 最近N个月
+    if m:
+        return fmt(_sub_months(today, int(float(m.group(1))))), fmt(today)
+    m = re.search(r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*周", t) #P10: 最近N周
+    if m:
+        return fmt(today - timedelta(weeks=int(float(m.group(1))))), fmt(today)
+    m = re.search(r"(?:最近|近|过去)\s*(\d+)\s*(?:天|个交易日)", t) #P11: 最近N天
+    if m:
+        return fmt(today - timedelta(days=int(m.group(1)))), fmt(today)
+    if re.search(r"(?:最近|近).*?0.5\s*年", t): #P12: 最近半年（中文'半'已转为0.5）
+        return fmt(_sub_months(today, 6)), fmt(today)
+    return None
+
 
 def _extract_symbols_from_source(source: str) -> list[str]:
     """从策略源码提取硬编码的 vt_symbol 列表（如 '600519.SH'），用于与 parsed['symbols'] 对齐"""
@@ -270,6 +595,10 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     if mode == "portfolio" and interval == "WEEKLY": #引擎驱动不支持WEEKLY，自动降为DAILY（策略内部可用pro.weekly()取周线数据）
         interval = "DAILY"; print("[parse] portfolio+WEEKLY → 引擎驱动降为DAILY（周线数据策略可通过pro.weekly()直接获取）")
     result.update({"interval": interval, "direction": direction, "mode": mode})
+    dr = _parse_date_range(txt) #日期关键词兜底解析
+    if dr:
+        result["start"], result["end"] = dr
+        print(f"[parse] 日期关键词解析: {dr[0]} ~ {dr[1]}")
     return result
 
 
@@ -389,6 +718,10 @@ def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
         blockers.append("vnpy无am.ma()方法，应使用am.sma()")
     if mode == "portfolio" and re.search(r"from\s+vnpy_portfoliostrategy\s+import\s+.*\bSignal\b", source):
         blockers.append("无效导入 Signal（vnpy_portfoliostrategy 不提供该符号）")
+    if re.search(r'pro\.(ths_member|ths_index|dc_member|tdx_member|dc_index|tdx_index)\s*\(', source): #板块API应由引擎调用
+        blockers.append("策略内禁止调用板块API(ths_member等)，成分股由引擎通过--symbols自动传入")
+    if mode == "portfolio" and re.search(r'self\.vt_symbols\s*=[^=]', source): #股票池所有权契约
+        blockers.append("Portfolio策略禁止覆盖self.vt_symbols，必须使用引擎传入的列表")
     if mode == "cta":
         if "ArrayManager" in source and "update_bar" not in source:
             warnings.append("使用了ArrayManager但未调用am.update_bar(bar)——运行时会自动注入兜底")
@@ -405,6 +738,24 @@ def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
             warnings.append("Portfolio策略应用self.get_pos(vt_symbol)而非self.pos")
     if "fixed_size" in source and "= 1" in source:
         warnings.append("fixed_size=1是玩具逻辑，应按资金动态计算")
+    source_no_comment = "\n".join(line.split("#")[0] for line in source.splitlines()) #排除注释行内容
+    if re.findall(r'["\'](\d{6})\.(SH|SZ)["\']', source_no_comment): #SH/SZ格式应为SSE/SZSE
+        warnings.append("标的代码应使用vnpy格式(.SSE/.SZSE)而非qgdata格式(.SH/.SZ)——运行时会自动转换")
+    if re.search(r'(?:start_date|end_date|begin_date)\s*=\s*["\']20\d{6}["\']', source): #硬编码日期
+        warnings.append("策略内不建议硬编码日期，回测区间由--start/--end参数控制")
+    if mode == "portfolio" and re.search(r'self\.capital\b', source): #self.capital应为available_cash
+        in_params = False
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("parameters") and "=" in stripped:
+                in_params = True
+            if in_params:
+                if "]" in stripped:
+                    in_params = False
+                continue
+            if "self.capital" in stripped:
+                warnings.append("请用self.available_cash替代self.capital(固定值)——运行时会自动注入兜底")
+                break
     if warnings:
         print(f"[lint] 策略({filename}){len(warnings)}个告警(运行时兜底):\n" + "\n".join(f"  ⚠ {w}" for w in warnings))
     if blockers:
@@ -919,8 +1270,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "report_url": report_url,
         "report_replay_url": report_replay_url,
         "report_summary_url": report_summary_url,
-        "start": args.start,
-        "end": args.end,
+        "start": args.start or parsed.get("start", ""),
+        "end": args.end or parsed.get("end", ""),
         "interval": args.interval or parsed["interval"],
         "capital": args.capital,
         "rate": args.rate,

@@ -344,6 +344,69 @@ quant-claw-push/
 
 ---
 
+## #11 板块/指数成分股解析 + 日期关键词兜底（2026-03-08）
+
+### 根因
+1. `_resolve_stock_pool` 只支持固定关键词（全市场/沪深300/创业板/科创板），不支持板块/行业/概念名称
+2. "沪深300"实现错误：返回主板+创业板全量股票（~4000只）而非真实300只成分股
+3. `parse_requirement` 不解析日期关键词（"最近1年"），LLM 已证明会编造错误日期
+
+### 架构决策
+- **指数成分股双路径**：主路径 `ths_member`（883300.TI 等已验证存在） → 降级路径东方财富公开 API（`datacenter-web.eastmoney.com/RPT_INDEX_COMPONENT`）
+- **板块映射三级查找**：静态 `THS_SECTOR_MAP`（60+ 条目全部经 API 验证） → 按日文件缓存 → `ths_index` API 模糊搜索
+- **板块名提取**：静态 key 最长子串匹配优先 → 正则提取（2-8 字符约束 + 反向排除词）
+- **日期解析双保险**：SKILL.md 约束 LLM 标准输出 + `_parse_date_range` 正则兜底 12 种模式（用 `relativedelta` 精确计算月/年）
+- **日期优先级链**：`args.start`(CLI) > `parsed["start"]`(正则) > 空(默认 today-365)
+- **新增 5 项 lint 检查**：策略调用板块 API(blocker) / Portfolio 覆盖 vt_symbols(blocker) / 硬编码 .SH/.SZ(warning) / 硬编码日期(warning) / self.capital(warning, 仅 portfolio)
+
+### 已知限制
+- **幸存者偏差**：板块成分股使用当前列表（`is_new='Y'`），历史回测存在偏差（如 2023 年的沪深300成分股与当前不同）。待 qgdata 提供历史成分股 API 后改进
+- **板块代码时效性**：`THS_SECTOR_MAP` 静态表可能随同花顺调整而过时，API 模糊搜索兜底可覆盖
+
+### 修改文件
+- `pipeline_orchestrator.py`：重构 `_resolve_stock_pool`（三级查找）、新增 `_resolve_index_members`/`_resolve_sector_members`/`_extract_sector_name`/`_parse_date_range`、新增 5 项 lint 检查、`cmd_submit` 日期优先级链
+- `SKILL.md`：新增板块成分股引擎解析约束 + 日期标准输出约束
+- `DEVLOG.md`：本条目
+
+---
+
+### #12 — 北交所(BJ)标的导致回测崩溃
+**日期**：2026-03-08  
+**现象**：人工智能板块回测 `20260308_120513` 在 3 秒内崩溃 `ValueError: 'BJ' is not a valid Exchange`  
+**5-Why 根因**：
+1. `Exchange("BJ")` 失败 → vnpy 枚举值是 `BSE` 不是 `BJ`
+2. 股票池含 `.BJ` 标的 → `ths_member` 返回全交易所成分股包括北交所
+3. `normalize_symbol` 不处理 `.BJ` → 只映射了 `.SH/.SZ/.SS`，遗漏北交所
+4. 之前用 `stock_basic+market` 不含北交所 → 新数据通道(ths_member)引入旧代码未覆盖的交易所
+5. **核心根因：交易所后缀映射表不完整，缺少 BJ→BSE**
+
+**修复**：
+- `normalize_symbol`：新增 `.BJ→.BSE` 后缀映射 + 纯 6 位数字 `83/43/87/920` 开头→BSE
+- `backtest_runner.py:872`：Exchange 解析加 try/except 防御，不支持的交易所跳过而非崩溃
+- 单元测试新增 6 个北交所用例（T51-T56），共 64 个全部通过
+
+---
+
+### #13 — 监控页"等待启动"卡死10分钟不更新
+**日期**：2026-03-08  
+**现象**：run_id `20260308_123839`（1019只人工智能标的）监控页持续显示"等待启动"10分钟，后端实际在跑  
+**5-Why 根因**：
+1. 页面默认"等待启动"→ 需SSE `step/progress`事件才切换到"运行中"
+2. SSE初始回放payload过大 → 1019只symbols序列化>60KB，浏览器EventSource解析阻塞/超时
+3. SSE断开后无任何恢复机制 → 页面永久卡在最后已知状态
+4. 健康检查只测HTTP可达 → 不验证SSE数据流是否实际可用
+5. **核心根因：监控系统100%依赖SSE实时流传递"运行真相"，无持久化状态轮询兜底；大payload可卡死SSE连接**
+
+**修复**：
+- 新增 `/api/state` REST端点：返回轻量JSON状态快照（去掉symbols列表/points/trades等大字段）
+- 前端加轮询兜底：页面加载1.5秒后首次轮询 + 每5秒定期fetch `/api/state`，SSE断也能自愈
+- SSE初始回放精简：`requirement.symbols`只发数量（"共1019只标的"）不发全量列表
+- 初始文案改为"连接中..." → 1.5秒后轮询自动切换到实际状态（running/等待启动/已完成）
+- 页面顶部新增"X秒前更新"心跳指示器，用户可直观判断数据是否在流动
+- broadcast()每次更新自动打_ts时间戳，轮询据此计算"最后更新时间"
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |

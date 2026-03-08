@@ -11,13 +11,26 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 STATE = {"run_id": "", "status": "waiting", "stage": "", "pct": 0, "dates": [], "points": [],
     "stats": {}, "logs": [], "done": False, "steps": {}, "requirement": {}, "code": "",
-    "code_file": "", "final": None, "trades": None, "positions": None, "position_snapshots": [], "bench_data": None, "report_urls": {}, "error": None}
+    "code_file": "", "final": None, "trades": None, "positions": None, "position_snapshots": [], "bench_data": None, "report_urls": {}, "error": None, "_ts": 0}
 LOCK = threading.Lock()
 CLIENTS = []
+
+def _slim_state():
+    """返回轻量状态快照（去掉大体积字段）用于 /api/state 和轮询"""
+    with LOCK: s = dict(STATE)
+    req = s.get("requirement", {})
+    slim_req = {k: (f"{len(v)}只" if k == "symbols" and isinstance(v, list) else v) for k, v in (req.items() if isinstance(req, dict) else [])}
+    return {"run_id": s.get("run_id", ""), "status": s.get("status", "waiting"), "stage": s.get("stage", ""), "pct": s.get("pct", 0),
+        "done": s.get("done", False), "steps": s.get("steps", {}), "stats": s.get("stats", {}), "logs": s.get("logs", [])[-20:],
+        "has_code": bool(s.get("code")), "code_file": s.get("code_file", ""), "has_curve": bool(s.get("final") or s.get("points")),
+        "has_trades": s.get("trades") is not None and len(s.get("trades", [])) > 0, "trade_count": len(s.get("trades") or []),
+        "point_count": len(s.get("points", [])), "requirement_summary": slim_req, "report_urls": s.get("report_urls", {}),
+        "error": s.get("error"), "ts": s.get("_ts", 0)}
 
 def broadcast(event, data):
     msg = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
     with LOCK:
+        STATE["_ts"] = int(time.time())
         dead = []
         for wfile in CLIENTS[:]:
             try: wfile.write(msg); wfile.flush()
@@ -107,7 +120,8 @@ pre.code-block code{font-family:'Cascadia Code','Fira Code','Consolas',monospace
 <div class="hdr">
   <div style="font-size:28px">📊</div><h1>量化策略监控</h1>
   <span class="rid" id="rid">-</span>
-  <span class="pill pill-w" id="gpill">等待启动</span>
+  <span class="pill pill-w" id="gpill">连接中...</span>
+  <span style="font-size:11px;color:#94a3b8;margin-left:8px" id="_hb"></span>
 </div>
 <div class="tl">
   <div class="tl-s"><div class="tl-d" id="td1">1</div><div class="tl-t">需求确认</div></div>
@@ -307,7 +321,38 @@ function renderPositions(){
   h+='</tbody></table>';
   if(posHistory.length>20)h+='<div style="text-align:center;color:#94a3b8;font-size:12px;padding:8px">显示最近20条，共'+posHistory.length+'条持仓快照</div>';
   el.innerHTML=h}
-es.onerror=()=>{addLog('⚠️ 连接断开，自动重连...')};
+es.onerror=()=>{addLog('⚠️ SSE断开，轮询兜底中...')};
+let _lastTs=0,_sseAlive=true,_pollTimer=null;
+es.addEventListener('progress',e2=>{_sseAlive=true});
+function _pollState(){
+  fetch('/api/state?run_id='+RID).then(r=>r.json()).then(d=>{
+    if(!d||!d.run_id)return;
+    const g=document.getElementById('gpill');
+    if(d.ts>_lastTs){_lastTs=d.ts}
+    if(d.status==='done'&&!STATE_DONE){
+      g.className='pill pill-s';g.textContent='已完成';STATE_DONE=true;
+      addLog('✅ 回测已完成（轮询恢复）');
+    }else if(d.status==='running'&&(g.textContent==='等待启动'||g.textContent==='连接中...')){
+      g.className='pill pill-r';g.textContent='执行中';
+    }else if(d.status==='waiting'&&g.textContent==='连接中...'){
+      g.className='pill pill-w';g.textContent='等待启动';
+    }
+    if(d.stage){document.getElementById('bar3').style.width=(d.pct||0)+'%'}
+    Object.values(d.steps||{}).forEach(st=>{const sn=parseInt(st.step)||0;setTL(sn,st.status)});
+    if(d.error&&d.error.message){
+      document.getElementById('errCard').style.display='block';
+      document.getElementById('errMsg').textContent=d.error.message;
+      g.className='pill pill-f';g.textContent='失败';
+    }
+    const now=Math.floor(Date.now()/1000);
+    const ago=_lastTs>0?now-_lastTs:0;
+    const hb=document.getElementById('_hb');
+    if(hb){hb.textContent=ago<5?'刚刚更新':ago<60?ago+'秒前更新':Math.floor(ago/60)+'分钟前更新'}
+  }).catch(()=>{})
+}
+var STATE_DONE=false;
+_pollTimer=setInterval(_pollState,5000);
+setTimeout(_pollState,1500);
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -326,8 +371,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
             with LOCK: CLIENTS.append(self.wfile)
             with LOCK: s = dict(STATE)
-            self._sse_send("progress", s)
-            if s.get("requirement"): self._sse_send("requirement", s["requirement"])
+            slim_prog = {k: v for k, v in s.items() if k not in ("points", "trades", "positions", "position_snapshots", "logs", "requirement", "code", "final", "bench_data", "dates")}
+            self._sse_send("progress", slim_prog)
+            req = s.get("requirement", {})
+            if req:
+                slim_req = dict(req) if isinstance(req, dict) else req
+                if isinstance(slim_req, dict) and "symbols" in slim_req and isinstance(slim_req["symbols"], list): slim_req["symbols"] = f"共{len(slim_req['symbols'])}只标的"
+                self._sse_send("requirement", slim_req)
             if s.get("code"): self._sse_send("code", {"filename": s["code_file"], "content": s["code"]})
             if s.get("dates"): self._sse_send("init_axis", {"dates": s["dates"]})
             if s.get("bench_data"): self._sse_send("bench_data", s["bench_data"])
@@ -389,6 +439,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/done":
             self._json_ok()
             self._mark_done()
+        elif path == "/api/state":
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+            self.wfile.write(json.dumps(_slim_state(), ensure_ascii=False).encode())
         elif path == "/api/health":
             self._json_ok()
         else:
