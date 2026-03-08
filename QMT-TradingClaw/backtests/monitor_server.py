@@ -322,11 +322,37 @@ function renderPositions(){
   h+='</tbody></table>';
   if(posHistory.length>20)h+='<div style="text-align:center;color:#94a3b8;font-size:12px;padding:8px">显示最近20条，共'+posHistory.length+'条持仓快照</div>';
   el.innerHTML=h}
-let _lastTs=0,_sseOk=true,_pollTimer=null;
-es.addEventListener('progress',e2=>{_sseOk=true;_lastTs=Math.floor(Date.now()/1000)});
-es.addEventListener('step',e2=>{_sseOk=true;_lastTs=Math.floor(Date.now()/1000)});
-es.addEventListener('point',e2=>{_sseOk=true;_lastTs=Math.floor(Date.now()/1000)});
-es.onerror=()=>{_sseOk=false;addLog('⚠️ SSE断开，轮询兜底中...')};
+let _lastTs=0,_sseOk=true,_pollIv=5000,_pollTimer=null;
+function _sseTouch(){_lastTs=Math.floor(Date.now()/1000);if(!_sseOk){_sseOk=true;_adaptPoll();addLog('✅ SSE已恢复')}}
+es.addEventListener('progress',()=>_sseTouch());
+es.addEventListener('step',()=>_sseTouch());
+es.addEventListener('point',()=>_sseTouch());
+es.onerror=()=>{if(_sseOk){_sseOk=false;addLog('⚠️ SSE断开，轮询兜底中...');_adaptPoll()}};
+function _adaptPoll(){
+  clearInterval(_pollTimer);
+  if(STATE_DONE)return;
+  _pollIv=_sseOk?15000:5000;
+  _pollTimer=setInterval(_pollState,_pollIv);
+}
+function _renderPollLogs(logs){
+  if(!logs||!logs.length)return;
+  const el=document.getElementById('logs');
+  const existing=el.innerText||'';
+  logs.forEach(m=>{if(m&&existing.indexOf(m)===-1)addLog(m)});
+}
+function _renderPollStats(stats){
+  if(!stats||Object.keys(stats).length===0)return;
+  const el=document.getElementById('c5');
+  if(el.classList.contains('empty')){
+    setBadge('b5','success');el.classList.remove('empty');
+    const fmt={total_return:['总收益率',true],annual_return:['年化收益',true],max_ddpercent:['最大回撤',true],sharpe_ratio:['夏普比率',true],winning_rate:['胜率',true],total_net_pnl:['总盈亏',false],total_trade_count:['交易次数',false],total_days:['交易天数',false]};
+    let h='<div class="stats-grid">';for(const[k,[lb,isPct]] of Object.entries(fmt)){const v=stats[k];if(v===undefined)continue;
+      const n=typeof v==='number';let disp=n?(isPct?v.toFixed(2)+'%':v.toFixed(4)):v;
+      const c=n?(v>=0?'pos':'neg'):'neu';
+      h+='<div class="sc"><div class="lb">'+lb+'</div><div class="vl '+c+'">'+disp+'</div></div>'}
+    el.innerHTML=h+'</div>';
+  }
+}
 function _pollState(){
   fetch('/api/state?run_id='+RID).then(r=>r.json()).then(d=>{
     if(!d||!d.run_id)return;
@@ -334,11 +360,13 @@ function _pollState(){
     if(d.ts>_lastTs){_lastTs=d.ts}
     if(d.status==='done'&&!STATE_DONE){
       g.className='pill pill-s';g.textContent='已完成';STATE_DONE=true;
-      addLog('✅ 回测已完成（轮询恢复）');
+      addLog('✅ 回测已完成（轮询恢复）');_adaptPoll();
     }else if(d.status==='running'&&(g.textContent==='等待启动'||g.textContent==='连接中...')){
       g.className='pill pill-r';g.textContent='执行中';
     }else if(d.status==='waiting'&&g.textContent==='连接中...'){
       g.className='pill pill-w';g.textContent='等待启动';
+    }else if(d.status==='failed'){
+      g.className='pill pill-f';g.textContent='失败';
     }
     if(d.stage){document.getElementById('bar3').style.width=(d.pct||0)+'%'}
     Object.values(d.steps||{}).forEach(st=>{const sn=parseInt(st.step)||0;setTL(sn,st.status)});
@@ -347,6 +375,7 @@ function _pollState(){
       document.getElementById('errMsg').textContent=d.error.message;
       g.className='pill pill-f';g.textContent='失败';
     }
+    if(!_sseOk){_renderPollLogs(d.logs);_renderPollStats(d.stats)}
     const now=Math.floor(Date.now()/1000);
     const ago=_lastTs>0?now-_lastTs:0;
     const hb=document.getElementById('_hb');
