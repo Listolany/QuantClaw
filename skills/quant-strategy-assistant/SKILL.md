@@ -27,17 +27,24 @@ metadata:
 | 条件 | 模式 | 策略基类 |
 |------|------|----------|
 | 单一标的 + 无组合关键词 | `cta` | `CtaTemplate` |
-| 多标的 / 含 `轮动/选股/组合/多标的/全市场/排列` | `portfolio` | `StrategyTemplate`（vnpy_portfoliostrategy） |
+| 以下任一条件满足 | `portfolio` | `StrategyTemplate`（vnpy_portfoliostrategy） |
+
+**portfolio 判定规则（分层，LLM 和 `parse_requirement()` 均遵循）**：
+1. **强信号**（任一出现即 portfolio）：`轮动/组合/多标的/全市场/等权/仓位分配/前N名`
+2. **弱信号 + 多标的上下文**（二者共现才 portfolio）：弱信号 `排序/筛选/选股/调仓/排列/持仓周期` 需同时存在多标的上下文（`板块/成分股/指数/行业/概念/股票池`）
+3. **标的数量 > 1**：`--symbols` 含 2 只以上自动 portfolio
+
+注意："多头排列"中的"排列"、"均线排序"在单标的场景不触发 portfolio。
 
 路由由 `parse_requirement()` 自动判定并写入 `parsed["mode"]`，agent 生成策略代码时必须使用对应基类。
 
-**Portfolio 引擎驱动约束**：Portfolio 回测引擎仅支持 DAILY 和分钟级驱动。周级策略用 `--interval DAILY`，在 `on_bars` 中按 `bar.datetime.weekday()==0`（周一）判断调仓日；周线指标直接用 `pro.weekly()` 获取，无需从日线合成。
+**Portfolio 引擎驱动约束**：Portfolio 回测引擎仅支持 DAILY 和分钟级驱动。周级策略用 `--interval DAILY`，在 `on_bars(bars)` 中按 `list(bars.values())[0].datetime.weekday()==0`（周一）判断调仓日；周线指标直接用 `pro.weekly()` 获取，无需从日线合成。
 
 **股票池所有权契约（强制）**：股票池由 `--symbols` 参数唯一定义 → 引擎加载数据 → 策略通过 `self.vt_symbols` 接收。策略代码 `__init__` 中**禁止覆盖 `vt_symbols`**，必须使用引擎传入的列表。所有标的代码使用 vnpy 格式（`600519.SSE`/`000858.SZSE`），不可使用 qgdata 格式（`.SH/.SZ`）。选股逻辑在 `on_bars(bars)` 中基于 `self.vt_symbols` 遍历和筛选。
 
 **板块/指数成分股由引擎自动解析（强制）**：用户说"人工智能板块"/"沪深300成分股"/"银行行业"等时，引擎会自动解析出完整成分股列表到 `--symbols`。策略代码中**禁止**自行调用 `pro.ths_member()`/`pro.ths_index()`/`pro.dc_member()` 等板块 API。
 
-**回测日期约束（强制）**：用户的回测日期意图必须由你转换为标准 `--start YYYYMMDD --end YYYYMMDD` 参数。例如用户说"最近1年"则根据当天日期计算 today-365 输出对应日期。用户未提及任何日期时，**不传** `--start/--end`（引擎默认最近1年）。**禁止**编造与用户意图不符的固定日期。
+**回测日期约束（强制）**：用户的回测日期意图必须由你转换为标准 `--start YYYYMMDD --end YYYYMMDD` 参数。例如用户说"最近1年"则根据当天日期计算 today-365 输出对应日期。用户未提及任何日期时，**不传** `--start/--end`（引擎默认最近1年，即 today-365 ~ today）。第1轮确认摘要中日期栏必须写"引擎默认最近1年"而非自行编造"近2年"等。**禁止**编造与用户意图不符的固定日期。
 
 ### 模拟/实盘检测（独立流程，不走三轮协议）
 
@@ -147,20 +154,27 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
    - 明确引导用户触发下一轮：
 
 ```
-需求已确认：{标的} / {快窗口}日{慢窗口}日 MA / {日线/分钟线} / {做多/做空}
+需求已确认：{标的} / {模式cta或portfolio} / {日线/分钟线} / {做多/做空} / {回测区间或"引擎默认最近1年"}
 请回复「开始生成」，我来为你生成策略代码并提交回测。
 ```
 
 **第 1 轮禁止**：不做代码生成、不调用 submit、不创建文件。
 **第 1 轮最多命令**：`data_capability_guard.py`（1条）。
 
-### 第 2 轮：代码生成 + 编译校验 + 提交
+### 第 2 轮：代码生成 + 提交（极速流程）
 
 **触发**：第 1 轮确认后，用户发送任意消息（`开始生成`/`好`/`1` 等）；若同条消息同时包含完整需求+第2轮触发词，也可直通第2轮。
 
 **直通首响（强制）**：直通第2轮时先立即回复一句 `已收到，开始生成中...`，再执行代码生成与提交，避免长时间无反馈。
 
-1. **生成策略代码**（agent 使用 LLM 能力）：
+**第 2 轮速度约束（强制）**：
+- **禁止**重跑 `data_capability_guard`（第 1 轮已检查）
+- **禁止**单独跑 `py_compile`（submit 内部已含编译+静态检查+预导入）
+- 理想路径 **2 次工具调用**：① 写策略文件 ② submit
+- submit **编译/lint 快速失败**（秒级退出，输出含 `compile_error` 或 `lint_error`）→ **在 Round 2 内立即修复**：读错误 → 改文件 → 重新 submit，最多 3 轮
+- submit 因运行时/超时/数据失败（已跑数分钟）→ **不在 Round 2 重试**，回复用户 run_id + monitor_url，在第 3 轮处理
+
+1. **生成策略代码**（agent 使用 LLM 能力，直接写入文件）：
    - 根据 `parsed["mode"]` 选择正确模板：
      - `cta` → 继承 `CtaTemplate`，`on_bar(self, bar)`，`self.buy(price, vol)` / `self.sell(price, vol)`，`self.pos`，初始化用 `self.load_bar(N)`（**单数**，N=bar 数量）
      - `portfolio` → 继承 `StrategyTemplate`（vnpy_portfoliostrategy），`on_bars(self, bars: dict)`，`self.buy(vt_symbol, price, vol)` / `self.sell(vt_symbol, price, vol)`，`self.get_pos(vt_symbol)`，初始化用 `self.load_bars(days)`（**复数**，days=天数）
@@ -182,15 +196,13 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
    - **CTA 必须在 `on_bar` 开头调用 `am.update_bar(bar)`**：否则 ArrayManager 永远不会 `inited`，导致全程 0 交易。引擎有运行时兜底但不能依赖
    - 写入 `${QUANTCLAW_ROOT}/strategies/{module_name}.py`
 
-2. **编译校验**（最多 3 轮 compile-fix 循环）：
-```bash
-"${PYTHON_BIN}" -m py_compile "${QUANTCLAW_ROOT}/strategies/{module_name}.py"
-```
-   - 编译通过 → 进入步骤 3
-   - 编译失败 → 读取错误信息，LLM 修复代码，重写文件，重新编译
-   - 超过 3 轮仍失败 → 告知用户并附错误信息，结束本轮
+**Portfolio 轮动策略速查**（减少生成思考时间）：
+- 周轮动：`on_bars(self, bars)` 中 `list(bars.values())[0].datetime.weekday()==0` 判断周一调仓
+- 排序选股：遍历 `self.vt_symbols` 计算因子 → `sorted()` → 取前N名
+- 等权全仓：每只 `self.available_cash / N`，按交易所规则取整手
+- 周线数据：`pro.weekly(ts_code=code, start_date=..., end_date=...)` 直取，无需从日线合成
 
-3. **提交回测**（`--symbols` 必须包含策略代码中所有会交易的标的，引擎仅为 `--symbols` 列表加载数据）：
+2. **直接提交**（submit 内置编译+静态检查+预导入，无需单独 py_compile）：
 ```bash
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" submit \
   --requirement "{用户原始需求}" \
@@ -202,8 +214,11 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
   --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8767}" \
   --timeout-sec 1200
 ```
+   - submit 内部自动执行：py_compile → _lint_strategy → _preflight_import → 启动回测
+   - 编译/lint 快速失败（秒级退出）→ 在 Round 2 内读错误、改代码、重新 submit（最多 3 轮）
+   - 运行时/超时/数据失败（已跑数分钟）→ 回复 run_id + monitor_url，第 3 轮处理
 
-4. **回复用户**（低延迟首响）：
+3. **回复用户**（低延迟首响）：
    - `run_id` + `monitor_url` + 当前状态
    - 引导词（必须覆盖两个语义点）：
      - A：打开监控页实时查看策略代码/曲线/交易
@@ -231,12 +246,14 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 | error_type | 含义 | agent 策略 |
 |-----------|------|-----------:|
 | `compile_error` | py_compile 失败 | 读 strategy_file + traceback → LLM 修复代码 → 重新提交 |
+| `lint_error` | 静态检查 blocker（如 am.ma()、vnpy.trading 导入） | 同 compile_error 处理 |
 | `runtime_error` | 回测运行时异常 | 读 strategy_file + traceback → LLM 分析修复 → 重新提交 |
+| `compat_error` | 引擎兼容性（如 portfolio+WEEKLY 未降级） | 提示用户调整参数，通常不应出现（parse_requirement 已自动降级） |
 | `data_error` | 数据加载失败/为空 | 提示用户检查标的代码/日期范围/token |
 | `config_error` | 环境/配置问题 | 提示用户检查配置 |
-| `timeout_error` | 超时 | 建议缩短日期范围 |
+| `timeout_error` | 超时 | 建议缩短日期范围或标的数量 |
 
-- 只对 `compile_error` 和 `runtime_error` 尝试自动修复，其余直接报告用户。
+- 只对 `compile_error`、`lint_error` 和 `runtime_error` 尝试自动修复，其余直接报告用户。
 - 自动修复最多 3 轮，超过交由用户决策。
 
 4. **完成后引导**（status=completed 时必须附带）：

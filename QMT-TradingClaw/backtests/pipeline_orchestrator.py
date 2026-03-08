@@ -590,8 +590,13 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     else:
         interval = "DAILY"
     direction = "bearish" if any(k in txt for k in ["下穿", "死叉"]) else "bullish"
-    multi_kw = ["轮动", "选股", "组合", "多标的", "portfolio", "多只", "排列", "全市场"]
-    mode = "portfolio" if (len(symbols) > 1 or any(k in txt for k in multi_kw)) else "cta"
+    _strong_kw = ["轮动", "组合", "多标的", "portfolio", "多只", "全市场", "等权", "仓位分配"] #任一即portfolio
+    _weak_kw = ["排序", "筛选", "选股", "调仓", "排列", "持仓周期"] #需配合pool上下文
+    _pool_re = re.compile(r"板块|成分股|指数|行业|概念|股票池")
+    _has_strong = any(k in txt for k in _strong_kw) or bool(re.search(r"前\d+名", txt))
+    _has_pool = bool(_pool_re.search(txt))
+    _has_weak = any(k in txt for k in _weak_kw)
+    mode = "portfolio" if (len(symbols) > 1 or _has_strong or (_has_pool and _has_weak)) else "cta"
     if mode == "portfolio" and interval == "WEEKLY": #引擎驱动不支持WEEKLY，自动降为DAILY（策略内部可用pro.weekly()取周线数据）
         interval = "DAILY"; print("[parse] portfolio+WEEKLY → 引擎驱动降为DAILY（周线数据策略可通过pro.weekly()直接获取）")
     result.update({"interval": interval, "direction": direction, "mode": mode})
