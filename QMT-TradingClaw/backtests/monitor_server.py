@@ -193,7 +193,7 @@ function setTL(n,st){
     else if(st==='failed'){el.className='tl-d err';el.textContent='✗'}
   })
 }
-function addLog(m){const e=document.getElementById('logs');const ml=m.replace(/(https?:\\/\\/[^\\s<]+)/g,'<a href="$1" target="_blank" style="color:#2563eb">$1</a>');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+ml+'</div>';e.scrollTop=e.scrollHeight}
+function addLog(m){const e=document.getElementById('logs');const ml=m.replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1" target="_blank" style="color:#2563eb">$1</a>');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+ml+'</div>';e.scrollTop=e.scrollHeight}
 let chart=null,dailyChart=null;
 function _initCharts(){
   if(chart)return;
