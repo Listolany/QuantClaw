@@ -257,7 +257,7 @@ def _ths_member_symbols(ts_code: str, token: str) -> list[str]:
     if df is None or df.empty:
         return []
     active = df[df["is_new"] == "Y"] if "is_new" in df.columns and not df[df["is_new"] == "Y"].empty else df
-    return [normalize_symbol(str(c)) for c in active["con_code"].tolist() if c]
+    return [s for s in (normalize_symbol(str(c)) for c in active["con_code"].tolist() if c) if s]
 
 
 def _resolve_index_members_em(index_code: str) -> list[str]:
@@ -444,7 +444,7 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
                     ts_codes = df.sort_values("_mv", ascending=False, na_position="last")["ts_code"].head(cap).tolist()
                 else: ts_codes = ts_codes[:cap]
             except Exception: ts_codes = ts_codes[:cap]
-        syms = [normalize_symbol(str(c)) for c in ts_codes]
+        syms = [s for s in (normalize_symbol(str(c)) for c in ts_codes) if s]
         syms, n_bse = _filter_bse(syms, txt)
         bse_msg = f"(已剔除{n_bse}只北交所标的，需开通北交所权限请明确指定)" if n_bse else ""
         return syms, bse_msg
@@ -549,7 +549,7 @@ def _extract_symbols_from_source(source: str) -> list[str]:
 def parse_requirement(requirement: str, symbols_override: Optional[str], token: str = "") -> Dict[str, Any]:
     txt = requirement.strip(); pool_warn = ""
     symbol_matches = re.findall(r"(?<!\d)(\d{6}\.(?:SZSE|SSE|SZ|SH|SS)|\d{6})(?!\d)", txt, flags=re.IGNORECASE)
-    symbols = [normalize_symbol(s) for s in symbol_matches]
+    symbols = [s for s in (normalize_symbol(m) for m in symbol_matches) if s]
     if symbols_override:
         symbols = [s for s in (normalize_symbol(x) for x in symbols_override.split(",") if x.strip()) if s] #过滤空值（池名/中文名）
     pool_api_failed = False
@@ -1445,7 +1445,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             strategy_file_path = STRATEGIES_DIR / f"{module_name}.py"
             fw, sw = parsed.get("fast_window", 5), parsed.get("slow_window", 10)
             if bt_mode == "portfolio":
-                source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"], [normalize_symbol(s) for s in parsed["symbols"]])
+                source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"], [s for s in (normalize_symbol(x) for x in parsed["symbols"]) if s])
             else:
                 source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"])
             strategy_file_path.write_text(source, encoding="utf-8")
