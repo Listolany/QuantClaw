@@ -871,7 +871,9 @@ def main():
     title = args.title or f"{','.join(vt_symbols[:3])} 回测净值曲线"
     symbols_exchanges, _bad = [], []
     for s in vt_symbols:
-        sym, ex_str = s.split(".")[0], s.split(".")[1]
+        parts = s.split(".")
+        if len(parts) < 2: _bad.append(s); p(f"  [warn] 跳过非法标的(缺交易所后缀): {s}"); continue
+        sym, ex_str = parts[0], parts[1]
         try: symbols_exchanges.append((sym, Exchange(ex_str)))
         except ValueError: _bad.append(s); p(f"  [warn] 跳过不支持的交易所: {s}")
     if _bad:

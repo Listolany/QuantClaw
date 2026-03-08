@@ -67,7 +67,8 @@ def normalize_symbol(raw: str) -> str:
         return f"{val}.SZSE"
     for old, new in {".SH": ".SSE", ".SS": ".SSE", ".SZ": ".SZSE", ".BJ": ".BSE"}.items():
         if val.endswith(old): return val[:-len(old)] + new
-    return val
+    if re.fullmatch(r"\d{6}\.(SSE|SZSE|BSE)", val): return val #已是标准格式
+    return "" #非合法代码返回空，防止池名/中文名穿透
 
 
 def read_env_value_from_files(key: str, candidates: list[Path]) -> str:
@@ -550,7 +551,7 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     symbol_matches = re.findall(r"(?<!\d)(\d{6}\.(?:SZSE|SSE|SZ|SH|SS)|\d{6})(?!\d)", txt, flags=re.IGNORECASE)
     symbols = [normalize_symbol(s) for s in symbol_matches]
     if symbols_override:
-        symbols = [normalize_symbol(s) for s in symbols_override.split(",") if s.strip()]
+        symbols = [s for s in (normalize_symbol(x) for x in symbols_override.split(",") if x.strip()) if s] #过滤空值（池名/中文名）
     pool_api_failed = False
     if not symbols:
         name_syms, name_warn = resolve_symbols_by_name(txt, token)
