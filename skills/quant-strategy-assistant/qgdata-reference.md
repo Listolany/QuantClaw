@@ -48,6 +48,10 @@ def vnpy2qg(c): s,e = c.split("."); return f"{s}.{VN2QG[e]}"
 | 股权质押 | 质押 | `pledge_stat`/`pledge_detail` | ts_code |
 | 分红/送转 | 分红 | `dividend` | ts_code |
 | 日K/周K/月K/分钟线 | 行情 | `daily`/`weekly`/`monthly`/`stk_mins` | ts_code+日期 |
+| 交易日历/节假日/是否交易日 | 日历 | `trade_cal` | exchange(SSE/SZSE)+start_date+end_date，返回cal_date+is_open |
+| 复权因子/前复权/后复权 | 复权 | `adj_factor` | ts_code+trade_date，用于长周期价格修正 |
+| 停牌/复牌/是否可交易 | 停复牌 | `suspend_d` | ts_code+trade_date，suspend_type=S停/R复 |
+| 涨停价/跌停价/一字板 | 涨跌停价 | `stk_limit` | ts_code+trade_date，返回up_limit/down_limit |
 | 技术因子/MACD/RSI | 因子 | `stk_factor_pro` | ts_code+日期范围 |
 | 热门股/人气排名 | 热榜 | `ths_hot`/`dc_hot` | trade_date |
 | 券商金股/机构推荐 | 研报 | `broker_recommend` | month |
@@ -108,6 +112,14 @@ vt_symbols = [qg2vnpy(c) for c in top]
 ```python
 df = pro.limit_list_d(trade_date='最近交易日', limit_type='U') #U=涨停
 codes = df['ts_code'].tolist()
+```
+
+### 交易日历（判断交易日/取前后N个交易日）
+
+```python
+cal = pro.trade_cal(exchange='SSE', start_date='20260101', end_date='20261231', is_open='1')
+trade_dates = cal['cal_date'].tolist()  # 全年交易日列表
+# 判断某日是否交易日：date_str in trade_dates
 ```
 
 ### 成分股数量预筛

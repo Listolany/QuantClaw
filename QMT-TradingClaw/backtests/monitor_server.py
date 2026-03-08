@@ -49,6 +49,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(1
 .tl-d{width:32px;height:32px;border-radius:50%;background:#e2e8f0;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#94a3b8;transition:all .3s}
 .tl-d.run{background:#dbeafe;color:#2563eb;animation:pulse 1.5s infinite}
 .tl-d.ok{background:#dcfce7;color:#16a34a}
+.tl-d.warn{background:#fef3c7;color:#d97706}
 .tl-d.err{background:#fee2e2;color:#dc2626}
 .tl-t{font-size:11px;color:#64748b;font-weight:600;white-space:nowrap}
 .tl-ln{flex:1;height:2px;background:#e2e8f0;min-width:48px;transition:background .3s}
@@ -174,10 +175,11 @@ function setTL(n,st){
   (map[n]||[]).forEach(d=>{const el=document.getElementById('td'+d);if(!el)return;
     if(st==='running'){el.className='tl-d run'}
     else if(st==='success'){el.className='tl-d ok';el.textContent='✓';const ln=document.getElementById('tln'+d);if(ln)ln.className='tl-ln ok'}
+    else if(st==='warning'){el.className='tl-d warn';el.textContent='⚠'}
     else if(st==='failed'){el.className='tl-d err';el.textContent='✗'}
   })
 }
-function addLog(m){const e=document.getElementById('logs');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+m+'</div>';e.scrollTop=e.scrollHeight}
+function addLog(m){const e=document.getElementById('logs');const ml=m.replace(/(https?:\\/\\/[^\\s<]+)/g,'<a href="$1" target="_blank" style="color:#2563eb">$1</a>');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+ml+'</div>';e.scrollTop=e.scrollHeight}
 const chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});
 const dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
 const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',

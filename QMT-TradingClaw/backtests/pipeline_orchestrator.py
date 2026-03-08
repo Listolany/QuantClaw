@@ -128,105 +128,106 @@ def resolve_monitor_public_base(explicit_base: str) -> str:
     return ""
 
 
-def resolve_symbols_by_name(requirement: str, token: str) -> list[str]:
+def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], str]:
+    """按中文名解析股票代码→(代码列表, 警告信息)"""
     candidates = re.findall(r"[\u4e00-\u9fff]{2,10}", requirement)
-    if not candidates:
-        return []
-    stop_words = {
-        "策略",
-        "回测",
-        "买入",
-        "卖出",
-        "上穿",
-        "下穿",
-        "均线",
-        "日线",
-        "分钟",
-        "执行",
-        "自动",
-        "编排",
-        "监控",
-        "链接",
-    }
-    names = [c for c in candidates if c not in stop_words]
-    if not names:
-        return []
-    try:
-        import qgdata as qg  # type: ignore
-
-        if token:
-            qg.set_token(token)
-        pro = qg.pro_api(timeout=8.0)
-        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
-        if df is None or len(df) == 0:
-            return []
-        all_rows = [(str(r["name"]), str(r["ts_code"])) for _, r in df.iterrows()]
-        out: list[str] = []
-        for name in names:
-            exact = [ts for nm, ts in all_rows if nm == name]
-            if exact:
-                out.append(normalize_symbol(exact[0]))
-                continue
-            fuzzy = [ts for nm, ts in all_rows if name in nm]
-            if len(fuzzy) == 1:
-                out.append(normalize_symbol(fuzzy[0]))
-        dedup = []
-        seen = set()
-        for sym in out:
-            if sym not in seen:
-                seen.add(sym)
-                dedup.append(sym)
-        return dedup
-    except Exception:
-        return []
-
-
-def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 50) -> list[str]:
-    """解析股票池关键词→实际代码列表（全市场取主板+创业板活跃标的，控制数量避免回测过慢）"""
-    pool_kw = {"全市场": "", "沪深主板": "主板", "创业板": "创业板", "科创板": "科创板", "沪深300": "主板", "中证500": "主板"}
-    matched = ""
-    for kw, market_filter in pool_kw.items():
-        if kw in txt:
-            matched = kw; break
-    if not matched:
-        return []
+    if not candidates: return [], ""
+    stop_words = {"策略","回测","买入","卖出","上穿","下穿","均线","日线","分钟","执行","自动","编排","监控","链接","股价","股票","交易","选股","市场","全市场","组合","轮动","设计","低于","高于","每天","每周","每月","以上","以下","成分股","龙虎榜","涨停","跌停"}
+    _sw_re = re.compile("|".join(re.escape(w) for w in sorted(stop_words, key=len, reverse=True)))
+    names = [c for c in candidates if _sw_re.sub("", c)]
+    if not names: return [], ""
+    if not token: return [], f"检测到股票名称「{'、'.join(names[:3])}」但未配置数据Token。请到 {QGDATA_RECHARGE_URL} 获取Token"
     try:
         import qgdata as qg
-        if token: qg.set_token(token)
-        pro = qg.pro_api(timeout=10)
-        fields = "ts_code,name,market"
-        df = pro.stock_basic(exchange="", list_status="L", fields=fields)
+        qg.set_token(token); pro = qg.pro_api(timeout=8.0)
+        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
         if df is None or len(df) == 0:
-            return []
-        if matched == "科创板":
-            df = df[df["market"] == "科创板"]
-        elif matched == "创业板":
-            df = df[df["market"] == "创业板"]
-        elif matched in ("全市场", "沪深300", "中证500", "沪深主板"):
-            df = df[df["market"].isin(["主板", "创业板"])]
-        codes = [normalize_symbol(str(r["ts_code"])) for _, r in df.iterrows()]
-        if len(codes) > max_stocks:
-            import random; random.seed(42); codes = random.sample(codes, max_stocks)
-        return codes
-    except Exception:
-        return []
+            return [], f"qgdata API 返回空数据（查询股票名「{'、'.join(names[:3])}」），可能Token额度不足。充值地址: {QGDATA_RECHARGE_URL}"
+        all_rows = [(str(r["name"]), str(r["ts_code"])) for _, r in df.iterrows()]
+        out, seen = [], set()
+        for name in names:
+            exact = [ts for nm, ts in all_rows if nm == name]
+            if exact: s = normalize_symbol(exact[0]);
+            else:
+                fuzzy = [ts for nm, ts in all_rows if name in nm]
+                s = normalize_symbol(fuzzy[0]) if len(fuzzy) == 1 else ""
+            if s and s not in seen: seen.add(s); out.append(s)
+        return out, ""
+    except Exception as exc:
+        return [], f"按名称查询股票失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
 
+
+QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
+
+def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[list[str], str]:
+    """解析股票池关键词→(代码列表, 警告信息)。警告非空表示关键词匹配但API失败。"""
+    pool_kw = {"全市场": "", "沪深主板": "主板", "创业板": "创业板", "科创板": "科创板", "沪深300": "主板", "中证500": "主板"}
+    matched = ""; txt_norm = re.sub(r"\s+", "", txt)
+    for kw, market_filter in pool_kw.items():
+        if kw in txt_norm:
+            matched = kw; break
+    if not matched:
+        return [], ""
+    if not token:
+        return [], f"检测到「{matched}」选股但未配置数据Token，无法获取股票列表。请到 {QGDATA_RECHARGE_URL} 获取Token"
+    try:
+        import qgdata as qg
+        qg.set_token(token); pro = qg.pro_api(timeout=10)
+        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,market")
+        if df is None or len(df) == 0:
+            return [], f"「{matched}」选股：qgdata API 返回空数据，可能Token额度不足。充值地址: {QGDATA_RECHARGE_URL}"
+        if matched == "科创板": df = df[df["market"] == "科创板"]
+        elif matched == "创业板": df = df[df["market"] == "创业板"]
+        elif matched in ("全市场", "沪深300", "中证500", "沪深主板"): df = df[df["market"].isin(["主板", "创业板"])]
+        try: cap = max(1, int(os.getenv("QC_POOL_MAX_STOCKS", str(max_stocks)) or max_stocks))
+        except Exception: cap = max_stocks
+        ts_codes = df["ts_code"].tolist()
+        if len(ts_codes) > cap:
+            try:
+                from datetime import datetime as _dt, timedelta as _td
+                mv = None
+                for i in range(7):
+                    mv = pro.daily_basic(trade_date=(_dt.now() - _td(days=i)).strftime("%Y%m%d"), fields="ts_code,total_mv")
+                    if mv is not None and not mv.empty: break
+                if mv is not None and not mv.empty:
+                    mv = mv.drop_duplicates("ts_code").set_index("ts_code")
+                    df = df.copy(); df["_mv"] = df["ts_code"].map(mv["total_mv"])
+                    ts_codes = df.sort_values("_mv", ascending=False, na_position="last")["ts_code"].head(cap).tolist()
+                else: ts_codes = ts_codes[:cap]
+            except Exception: ts_codes = ts_codes[:cap]
+        return [normalize_symbol(str(c)) for c in ts_codes], ""
+    except Exception as exc:
+        return [], f"「{matched}」选股失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
+
+def _extract_symbols_from_source(source: str) -> list[str]:
+    """从策略源码提取硬编码的 vt_symbol 列表（如 '600519.SH'），用于与 parsed['symbols'] 对齐"""
+    hits = re.findall(r'["\'](\d{6})\.(SH|SZ|SSE|SZSE|BSE|BJ)["\']', source)
+    seen, out = set(), []
+    for code, suffix in hits:
+        vt = normalize_symbol(f"{code}.{suffix}")
+        if vt and vt not in seen: seen.add(vt); out.append(vt)
+    return out
 
 def parse_requirement(requirement: str, symbols_override: Optional[str], token: str = "") -> Dict[str, Any]:
-    txt = requirement.strip()
+    txt = requirement.strip(); pool_warn = ""
     symbol_matches = re.findall(r"(?<!\d)(\d{6}\.(?:SZSE|SSE|SZ|SH|SS)|\d{6})(?!\d)", txt, flags=re.IGNORECASE)
     symbols = [normalize_symbol(s) for s in symbol_matches]
     if symbols_override:
         symbols = [normalize_symbol(s) for s in symbols_override.split(",") if s.strip()]
     if not symbols:
-        symbols = resolve_symbols_by_name(txt, token)
+        name_syms, name_warn = resolve_symbols_by_name(txt, token)
+        if name_syms: symbols = name_syms
+        elif name_warn: pool_warn = name_warn; print(f"[ERROR] {name_warn}")
     if not symbols:
-        pool = _resolve_stock_pool(txt, token)
-        symbols = pool if pool else ["000001.SZSE"]
+        pool, pw = _resolve_stock_pool(txt, token)
+        if pool: symbols = pool
+        elif pw: pool_warn = pool_warn or pw; print(f"[ERROR] {pw}"); symbols = ["000001.SZSE"]
+        else: symbols = ["000001.SZSE"]
 
     ma_kw = ["均线", "上穿", "下穿", "金叉", "死叉", "SMA", "sma", "EMA", "ema", "日线交叉", "移动平均"]
     is_ma = any(k in txt for k in ma_kw) or bool(re.search(r'\bMA\b(?!CD)', txt))
     result: Dict[str, Any] = {"symbols": symbols}
+    if pool_warn: result["pool_warning"] = pool_warn
     if is_ma:
         windows = [int(m.group(1)) for m in re.finditer(r"(\d+)\s*日", txt)]
         if len(windows) >= 2:
@@ -251,6 +252,8 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     direction = "bearish" if any(k in txt for k in ["下穿", "死叉"]) else "bullish"
     multi_kw = ["轮动", "选股", "组合", "多标的", "portfolio", "多只", "排列", "全市场"]
     mode = "portfolio" if (len(symbols) > 1 or any(k in txt for k in multi_kw)) else "cta"
+    if mode == "portfolio" and interval == "WEEKLY": #引擎驱动不支持WEEKLY，自动降为DAILY（策略内部可用pro.weekly()取周线数据）
+        interval = "DAILY"; print("[parse] portfolio+WEEKLY → 引擎驱动降为DAILY（周线数据策略可通过pro.weekly()直接获取）")
     result.update({"interval": interval, "direction": direction, "mode": mode})
     return result
 
@@ -360,6 +363,63 @@ def detect_strategy_class(filepath: Path) -> str:
         return classes[0] if classes else ""
     except Exception:
         return ""
+
+
+def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
+    """策略代码静态检查——在py_compile之后、submit之前执行。blocker=必崩抛异常，warning=仅日志(运行时有兜底)"""
+    warnings, blockers = [], []
+    if "vnpy.trading." in source:
+        blockers.append("错误包路径 vnpy.trading.*，应为 vnpy.trader.*")
+    if "am.ma(" in source:
+        blockers.append("vnpy无am.ma()方法，应使用am.sma()")
+    if mode == "portfolio" and re.search(r"from\s+vnpy_portfoliostrategy\s+import\s+.*\bSignal\b", source):
+        blockers.append("无效导入 Signal（vnpy_portfoliostrategy 不提供该符号）")
+    if mode == "cta":
+        if "ArrayManager" in source and "update_bar" not in source:
+            warnings.append("使用了ArrayManager但未调用am.update_bar(bar)——运行时会自动注入兜底")
+        if "on_bar" in source and "self.am" in source and "ArrayManager" not in source and "__init__" in source:
+            warnings.append("引用了self.am但可能未初始化ArrayManager")
+        if "load_bars(" in source and "CtaTemplate" in source:
+            warnings.append("CTA策略应用load_bar(N)而非load_bars(days)——运行时会自动降级")
+    elif mode == "portfolio":
+        if "ArrayManager" in source and "update_bar" not in source:
+            warnings.append("使用了ArrayManager但未调用am.update_bar(bar)——运行时会自动注入兜底")
+        if "load_bar(" in source and "StrategyTemplate" in source:
+            warnings.append("Portfolio策略应用load_bars(days)而非load_bar(N)——运行时会自动降级")
+        if "self.pos" in source and "get_pos" not in source:
+            warnings.append("Portfolio策略应用self.get_pos(vt_symbol)而非self.pos")
+    if "fixed_size" in source and "= 1" in source:
+        warnings.append("fixed_size=1是玩具逻辑，应按资金动态计算")
+    if warnings:
+        print(f"[lint] 策略({filename}){len(warnings)}个告警(运行时兜底):\n" + "\n".join(f"  ⚠ {w}" for w in warnings))
+    if blockers:
+        msg = f"策略({filename}){len(blockers)}个阻断(必崩):\n" + "\n".join(f"  ✗ {w}" for w in blockers)
+        print(f"[lint] {msg}")
+        raise ValueError(msg)
+
+
+def _preflight_strategy_import(module_name: str, python_bin: str) -> None:
+    """预导入策略模块：在启动回测前捕获ImportError/ModuleNotFoundError。"""
+    cmd = [
+        python_bin,
+        "-c",
+        (
+            "import sys,importlib;"
+            f"sys.path.insert(0,{json.dumps(str((PROJECT_ROOT / 'vnpy_qmt').resolve()))});"
+            f"sys.path.insert(0,{json.dumps(str((PROJECT_ROOT / 'strategies').resolve()))});"
+            f"importlib.import_module({json.dumps(module_name)})"
+        ),
+    ]
+    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
+
+class EngineCompatError(Exception):
+    """引擎兼容性不支持"""
+
+def _validate_engine_compat(mode: str, interval: str) -> None:
+    """引擎兼容性前置闸门：在启动runner前拦截已知不支持组合。"""
+    iv = (interval or "").upper()
+    if mode == "portfolio" and iv == "WEEKLY":
+        raise EngineCompatError("Portfolio引擎驱动不支持WEEKLY，请用--interval DAILY；周线指标可在策略内通过pro.weekly()获取，调仓日按weekday判断")
 
 
 def normalize_public_base(base: str) -> str:
@@ -607,10 +667,9 @@ class {class_name}(CtaTemplate):
     author = "{author}"
     fast_window = {fast}
     slow_window = {slow}
-    capital = 1000000.0
     direction_hint = "{direction}"
 
-    parameters = ["fast_window", "slow_window", "capital", "direction_hint"]
+    parameters = ["fast_window", "slow_window", "direction_hint"]
     variables = ["fast_ma", "slow_ma"]
 
     def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
@@ -644,9 +703,11 @@ class {class_name}(CtaTemplate):
         cross_up = self.prev_fast <= self.prev_slow and self.fast_ma > self.slow_ma
         cross_down = self.prev_fast >= self.prev_slow and self.fast_ma < self.slow_ma
 
+        cash = getattr(self, 'available_cash', 1000000)  #引擎注入的可用现金
         if self.pos == 0 and cross_up:
-            vol = _calc_volume(self.vt_symbol, bar.close_price, self.capital)
-            self.buy(bar.close_price * 1.31, vol)
+            vol = _calc_volume(self.vt_symbol, bar.close_price, cash)
+            if vol > 0:
+                self.buy(bar.close_price * 1.31, vol)
         elif self.pos > 0 and cross_down:
             self.sell(bar.close_price * 0.69, abs(self.pos))
 
@@ -709,7 +770,8 @@ class {class_name}(StrategyTemplate):
         pass
 
     def on_bars(self, bars: dict[str, BarData]):
-        per_capital = self.capital / max(len(self.vt_symbols), 1)
+        cash = getattr(self, 'available_cash', getattr(self, 'capital', 1000000))
+        per_capital = cash / max(len(self.vt_symbols), 1)
         for vt_symbol in self.vt_symbols:
             bar = bars.get(vt_symbol)
             if not bar:
@@ -897,6 +959,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 1
 
     monitor_post(monitor_base, "/api/requirement", {"requirement": args.requirement, **parsed, "run_id": run_id})
+    if parsed.get("pool_warning"):
+        monitor_step(monitor_base, step="1", status="warning", title="数据源警告", msg=parsed["pool_warning"], run_id=run_id)
     monitor_step(monitor_base, step="1", status="success", title="需求确认", msg="监控页面已启动", run_id=run_id)
     store.mark_step(state, "monitor", "success", "monitor started and requirement posted")
 
@@ -909,25 +973,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
     state["status"] = "running"
     store.save(state)
 
-    print(
-        json.dumps(
-            {
-                "status": "accepted",
-                "run_id": run_id,
-                "monitor_url": monitor_url,
-                "monitor_url_local": monitor_url_local,
-                "monitor_public_base": resolved_monitor_public_base,
-                "monitor_public_reachable": public_reachable,
-                "monitor_public_probe_error": public_probe_error,
-                "report_url": report_url,
-                "report_replay_url": report_replay_url,
-                "report_summary_url": report_summary_url,
-                "state_file": str(store.state_file),
-                "worker_pid": worker_proc.pid,
-            },
-            ensure_ascii=False,
-        )
-    )
+    submit_result = {
+        "status": "accepted",
+        "run_id": run_id,
+        "monitor_url": monitor_url,
+        "monitor_url_local": monitor_url_local,
+        "monitor_public_base": resolved_monitor_public_base,
+        "monitor_public_reachable": public_reachable,
+        "monitor_public_probe_error": public_probe_error,
+        "report_url": report_url,
+        "report_replay_url": report_replay_url,
+        "report_summary_url": report_summary_url,
+        "state_file": str(store.state_file),
+        "worker_pid": worker_proc.pid,
+    }
+    if parsed.get("pool_warning"): submit_result["pool_warning"] = parsed["pool_warning"]
+    print(json.dumps(submit_result, ensure_ascii=False))
     return 0
 
 
@@ -982,11 +1043,21 @@ def cmd_worker(args: argparse.Namespace) -> int:
             state["artifacts"]["strategy_snapshot"] = str(snapshot_path)
             strategy_file_path = Path(ext_strategy_file)
             source = strategy_file_path.read_text(encoding="utf-8")
+            bt_mode = parsed.get("mode", "cta")
+            subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
+            _lint_strategy(source, strategy_file_path.name, bt_mode)
+            _preflight_strategy_import(module_name, payload["python_bin"])
             monitor_post(monitor_base, "/api/code", {"filename": strategy_file_path.name, "content": source})
             monitor_step(monitor_base, step="2", status="success", title="策略加载", msg=f"外部策略已加载: {strategy_file_path.name}", run_id=run_id)
             state["artifacts"]["strategy_file"] = ext_strategy_file
             state["status"] = "code_ready"
             store.mark_step(state, "strategy_generation", "success", f"external: {strategy_file_path.name}")
+            code_syms = _extract_symbols_from_source(source) #兜底：检测策略源码是否硬编码了标的（违反股票池契约）
+            if code_syms:
+                merged = list(dict.fromkeys(parsed["symbols"] + code_syms))
+                if len(merged) > len(parsed["symbols"]):
+                    print(f"[warn] 策略源码硬编码了{len(code_syms)}个标的(应由--symbols传入)，兜底合并: {len(parsed['symbols'])}→{len(merged)}")
+                    parsed["symbols"] = merged; payload["parsed"] = parsed; state["payload"] = payload; store.save(state)
         else:
             bt_mode = parsed.get("mode", "cta")
             monitor_step(monitor_base, step="2", status="running", title="策略生成", msg=f"正在生成{bt_mode.upper()}策略代码", run_id=run_id)
@@ -1000,11 +1071,14 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"])
             strategy_file_path.write_text(source, encoding="utf-8")
             subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
+            _lint_strategy(source, strategy_file_path.name, bt_mode)
+            _preflight_strategy_import(module_name, payload["python_bin"])
             monitor_post(monitor_base, "/api/code", {"filename": strategy_file_path.name, "content": source})
             monitor_step(monitor_base, step="2", status="success", title="策略生成", msg=f"策略已生成: {strategy_file_path.name}", run_id=run_id)
             state["artifacts"]["strategy_file"] = str(strategy_file_path)
             store.mark_step(state, "strategy_generation", "success", strategy_file_path.name)
 
+        _validate_engine_compat(parsed.get("mode", "cta"), payload["interval"])
         monitor_step(monitor_base, step="3", status="success", title="策略就绪", msg=f"策略已就绪: {module_name}.{class_name}", run_id=run_id)
         monitor_step(monitor_base, step="4", status="running", title="回测执行", msg="回测已启动", run_id=run_id)
         cmd = [
@@ -1116,6 +1190,22 @@ def cmd_worker(args: argparse.Namespace) -> int:
         _structured_error(state, "compile_error", "strategy_generation", str(exc), _tb.format_exc())
         _fail_report(state, str(exc))
         monitor_step(monitor_base, step="9", status="failed", title="编译失败", msg=str(exc)[:200], run_id=run_id)
+        store.save(state)
+        return 1
+    except EngineCompatError as exc:
+        import traceback as _tb
+        state["status"] = "failed"
+        _structured_error(state, "compat_error", "engine_compatibility", str(exc), _tb.format_exc())
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="引擎兼容性不支持", msg=str(exc)[:200], run_id=run_id)
+        store.save(state)
+        return 1
+    except ValueError as exc:
+        import traceback as _tb
+        state["status"] = "failed"
+        _structured_error(state, "lint_error", "strategy_generation", str(exc), _tb.format_exc())
+        _fail_report(state, str(exc))
+        monitor_step(monitor_base, step="9", status="failed", title="静态检查失败", msg=str(exc)[:200], run_id=run_id)
         store.save(state)
         return 1
     except TimeoutError as exc:
@@ -1299,11 +1389,11 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
             pro = qg.pro_api(timeout=5.0)
             df = pro.stock_basic(exchange="", list_status="L", fields="ts_code", limit=1)
             token_ok = df is not None and len(df) > 0
-            _check("QGDATA_TOKEN", token_ok, token[:6] + "***", "Token 校验通过" if token_ok else "Token 无效或接口无权限，请确认 Pro 套餐")
+            _check("QGDATA_TOKEN", token_ok, token[:6] + "***", "Token 校验通过" if token_ok else f"Token 无效或接口无权限，请到 {QGDATA_RECHARGE_URL} 确认套餐或充值")
         except Exception as e:
-            _check("QGDATA_TOKEN", False, token[:6] + "***", f"Token 校验异常: {e}")
+            _check("QGDATA_TOKEN", False, token[:6] + "***", f"Token 校验异常: {e}。充值/获取: {QGDATA_RECHARGE_URL}")
     else:
-        _check("QGDATA_TOKEN", False, "", "未配置，前往 https://quantgo.ai/data 获取")
+        _check("QGDATA_TOKEN", False, "", f"未配置，前往 {QGDATA_RECHARGE_URL} 获取")
 
     ctrl = os.getenv("OPENCLAW_CONTROL_URL", "") or read_env_value_from_files("OPENCLAW_CONTROL_URL", [PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env"])
     if ctrl:

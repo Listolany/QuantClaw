@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """通用回测执行器 - 内置锁/心跳/数据/统计/曲线/实时监控（同进程线程）"""
-import sys, os, time, json, argparse, importlib, threading
+import sys, os, time, json, argparse, importlib, threading, inspect
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode, quote
@@ -19,6 +19,7 @@ from vnpy_xt.qg_datafeed import QgDatafeed
 
 BASE = str((PROJECT_ROOT / "backtests").resolve())
 LOCK = os.path.join(BASE, ".run_lock")
+QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 MONITOR = ""  # http://127.0.0.1:port（启用时设置）
 
@@ -77,14 +78,14 @@ def _start_monitor(port):
 def validate_token(token, total_stages):
     stage(1, total_stages, "running", "检查qgdata token")
     if not token or len(token.strip()) < 20:
-        stage(1, total_stages, "failed", "qgdata token为空或格式异常"); p("  订阅地址: https://quantgo.ai/data"); sys.exit(1)
+        stage(1, total_stages, "failed", "qgdata token为空或格式异常"); p(f"  订阅地址: {QGDATA_RECHARGE_URL}"); sys.exit(1)
     try:
         import qgdata as qg; qg.set_token(token.strip()); pro = qg.pro_api(timeout=15.0)
         pro.daily(ts_code="000001.SZ", start_date="20250101", end_date="20250110")
         stage(1, total_stages, "success", "qgdata token检查通过")
     except Exception as e:
         stage(1, total_stages, "failed", f"qgdata token检查失败: {type(e).__name__}")
-        p(f"  可能原因: token无效/额度用尽/网络异常\n  订阅: https://quantgo.ai/data\n  错误: {str(e)[:160]}"); sys.exit(1)
+        p(f"  可能原因: token无效/额度用尽/网络异常\n  充值/获取Token: {QGDATA_RECHARGE_URL}\n  错误: {str(e)[:160]}"); sys.exit(1)
 
 def _bar(done, total, w=24):
     if total <= 0: return "[" + "-" * w + "]"
@@ -94,10 +95,54 @@ def _emit_progress(total_stages, done, total, tag="回测"):
     pct = int(done * 100 / total)
     p(f"[3/{total_stages}][running] {tag}进度 {done}/{total} {pct}% {_bar(done,total)}")
 
-def _attach_progress(engine, mode, total_stages, capital=100000, size=1):
-    """挂钩回测引擎，实时上报进度；CTA模式额外估算净值"""
-    state = {"done": 0, "last": -1, "trades_n": 0, "realized": 0.0, "pos": 0.0, "avg_cost": 0.0, "err": ""}
-    MONITOR_STEP = 10  # 每10根K线上报一次
+def _serialize_trade_rows(trades):
+    rows, pos_map, cost_map = [], {}, {}
+    for t in sorted(list(trades or []), key=lambda x: getattr(x, "datetime", datetime.min)):
+        dt_str = t.datetime.strftime("%Y-%m-%d") if hasattr(t.datetime, "strftime") else str(t.datetime)[:10]
+        direction = "BUY" if t.direction == Direction.LONG else "SELL"
+        price, volume, pnl = float(t.price), float(t.volume), ""
+        sym = getattr(t, 'vt_symbol', '') or ''
+        pos, avg_cost = pos_map.get(sym, 0.0), cost_map.get(sym, 0.0)
+        if direction == "BUY":
+            new_pos = pos + volume
+            avg_cost = (avg_cost * pos + price * volume) / new_pos if new_pos > 0 else 0
+            pos = new_pos
+        else:
+            if avg_cost > 0: pnl = f"{(price - avg_cost) * volume:.2f}"
+            pos = max(pos - volume, 0)
+            if pos == 0: avg_cost = 0
+        pos_map[sym], cost_map[sym] = pos, avg_cost
+        rows.append({"date": dt_str, "symbol": sym, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}", "pnl": pnl})
+    return rows
+
+def _attach_progress(engine, mode, total_stages, capital=100000, size=1, vt_symbols=None):
+    """挂钩回测引擎，按交易日推送净值/交易/持仓（日线每bar推一次，分钟线每日收盘推一次）"""
+    state = {"done": 0, "last": -1, "trades_n": 0, "realized": 0.0, "pos": 0.0, "avg_cost": 0.0, "err": "",
+             "cur_date": None, "eod_close": 0.0, "eod_sym": ""}
+    def _dkey(dt_obj):
+        return dt_obj.date() if hasattr(dt_obj, 'date') else str(dt_obj)[:10]
+    def _dstr(d):
+        return d.strftime("%Y-%m-%d") if hasattr(d, 'strftime') else str(d)[:10]
+    def _flush_eod(date_str, close_price, sym_hint=""):
+        """推送某交易日收盘快照：净值、交易、持仓"""
+        trades = list(engine.trades.values())
+        for t in trades[state["trades_n"]:]:
+            vol = float(t.volume)
+            if t.direction == Direction.LONG:
+                new_pos = state["pos"] + vol
+                state["avg_cost"] = (state["avg_cost"] * state["pos"] + float(t.price) * vol) / new_pos if new_pos > 0 else 0
+                state["pos"] = new_pos
+            else:
+                state["realized"] += (float(t.price) - state["avg_cost"]) * vol * size
+                state["pos"] = max(state["pos"] - vol, 0)
+                if state["pos"] == 0: state["avg_cost"] = 0
+        state["trades_n"] = len(trades)
+        unrealized = state["pos"] * (close_price - state["avg_cost"]) * size if state["pos"] > 0 else 0
+        nav = (capital + state["realized"] + unrealized) / capital
+        _report("/api/point", dt=date_str, nav=f"{nav:.6f}")
+        if MONITOR: _report_post("/api/trades", {"trades": _serialize_trade_rows(trades)})
+        if int(state["pos"]) > 0 and sym_hint:
+            _report_post("/api/position_snapshot", {"date": date_str, "positions": [{"symbol": sym_hint, "volume": int(state["pos"]), "price": f"{close_price:.2f}", "value": f"{state['pos'] * close_price:.0f}"}]})
     if mode == "cta":
         total = len(getattr(engine, "history_data", []) or [])
         con_step = max(total // 20, 1) if total else 1
@@ -109,32 +154,21 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1):
                 _report("/api/log", msg=f"策略运行异常: {state['err']}")
                 raise
             state["done"] += 1; d = state["done"]
-            if d == 1 or d == total or d - state["last"] >= con_step: # 控制台进度
+            if d == 1 or d == total or d - state["last"] >= con_step:
                 state["last"] = d; _emit_progress(total_stages, d, total, "CTA回放")
-            if MONITOR and (d % MONITOR_STEP == 0 or d == 1 or d == total): # 上报monitor
-                pct = 20 + int(60 * d / max(total, 1))
-                _report("/api/progress", run_id=RUN_ID, status="running", stage=f"CTA回放 {d}/{total} ({pct}%)", pct=min(pct, 80))
-                trades = list(engine.trades.values())
-                for t in trades[state["trades_n"]:]: # 增量处理新成交
-                    vol = float(t.volume)
-                    if t.direction == Direction.LONG:
-                        new_pos = state["pos"] + vol
-                        state["avg_cost"] = (state["avg_cost"] * state["pos"] + float(t.price) * vol) / new_pos if new_pos > 0 else 0
-                        state["pos"] = new_pos
-                    else:
-                        state["realized"] += (float(t.price) - state["avg_cost"]) * vol * size
-                        state["pos"] = max(state["pos"] - vol, 0)
-                        if state["pos"] == 0: state["avg_cost"] = 0
-                state["trades_n"] = len(trades)
-                unrealized = state["pos"] * (float(data.close_price) - state["avg_cost"]) * size if state["pos"] > 0 else 0
-                nav = (capital + state["realized"] + unrealized) / capital
-                dt_str = data.datetime.strftime("%Y-%m-%d") if hasattr(data.datetime, "strftime") else str(data.datetime)[:10]
-                _report("/api/point", dt=dt_str, nav=f"{nav:.6f}")
-                if int(state["pos"]) > 0:
-                    sym = getattr(engine, "vt_symbol", "") or (vt_symbols[0] if vt_symbols else "")
-                    _report_post("/api/position_snapshot", {"date": dt_str, "positions": [{"symbol": sym, "volume": int(state["pos"]), "price": f"{data.close_price:.2f}", "value": f"{state['pos'] * data.close_price:.0f}"}]})
+            cur = _dkey(data.datetime); close = float(data.close_price)
+            sym = getattr(engine, "vt_symbol", "") or (vt_symbols[0] if vt_symbols else "")
+            if MONITOR:
+                if state["cur_date"] is not None and cur != state["cur_date"]:  # 日切：推送前一交易日收盘快照
+                    _flush_eod(_dstr(state["cur_date"]), state["eod_close"], state["eod_sym"])
+                    pct = 20 + int(60 * d / max(total, 1))
+                    _report("/api/progress", run_id=RUN_ID, status="running", stage=f"CTA回放 {d}/{total} ({pct}%)", pct=min(pct, 80))
+                state["cur_date"] = cur; state["eod_close"] = close; state["eod_sym"] = sym
+                if d == total:  # 最后一根bar：推送当日
+                    _flush_eod(_dstr(cur), close, sym)
+                    _report("/api/progress", run_id=RUN_ID, status="running", stage=f"CTA回放 {d}/{total} (80%)", pct=80)
         engine.new_bar = wrap
-    else: # portfolio模式
+    else:
         total = len(getattr(engine, "dts", []) or [])
         con_step = max(total // 20, 1) if total else 1
         old = engine.new_bars
@@ -148,15 +182,27 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1):
             state["done"] += 1; d = state["done"]
             if d == 1 or d == total or d - state["last"] >= con_step:
                 state["last"] = d; _emit_progress(total_stages, d, total, "Portfolio回放")
-            if MONITOR and (d % MONITOR_STEP == 0 or d == 1 or d == total):
-                pct = 20 + int(60 * d / max(total, 1))
-                _report("/api/progress", run_id=RUN_ID, status="running", stage=f"Portfolio回放 {d}/{total}", pct=min(pct, 80))
-                strat = engine.strategy
-                if strat and hasattr(strat, "get_pos"):
-                    dt_str = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
-                    pos_list = [{"symbol": s, "volume": strat.get_pos(s)} for s in vt_syms if strat.get_pos(s) != 0]
-                    if pos_list:
-                        _report_post("/api/position_snapshot", {"date": dt_str, "positions": pos_list})
+            cur = _dkey(dt)
+            if MONITOR:
+                def _portfolio_eod(date_key):
+                    dt_s = _dstr(date_key)
+                    strat = engine.strategy
+                    _report_post("/api/trades", {"trades": _serialize_trade_rows(list(engine.trades.values()))})
+                    if strat and hasattr(strat, "get_pos"):
+                        pos_list = [{"symbol": s, "volume": strat.get_pos(s)} for s in vt_syms if strat.get_pos(s) != 0]
+                        if pos_list:
+                            _report_post("/api/position_snapshot", {"date": dt_s, "positions": pos_list})
+                    tv = getattr(strat, "total_value", 0) if strat else 0
+                    if tv > 0:
+                        _report("/api/point", dt=dt_s, nav=f"{tv / capital:.6f}")
+                if state["cur_date"] is not None and cur != state["cur_date"]:
+                    pct = 20 + int(60 * d / max(total, 1))
+                    _report("/api/progress", run_id=RUN_ID, status="running", stage=f"Portfolio回放 {d}/{total}", pct=min(pct, 80))
+                    _portfolio_eod(state["cur_date"])
+                state["cur_date"] = cur
+                if d == total:
+                    _report("/api/progress", run_id=RUN_ID, status="running", stage=f"Portfolio回放 {d}/{total} (80%)", pct=80)
+                    _portfolio_eod(cur)
         engine.new_bars = wrap
     return state
 
@@ -221,81 +267,316 @@ def _patch_lot_compliance(engine, vt_symbols, mode):
             return _orig(strategy, vt_symbol, direction, offset, price, adj, lock, net)
         engine.send_order = _wrap
 
-def _patch_account_model(engine, interval, capital, rate):
-    """A股账户模型（对齐rqalpha/聚宽/backtrader）：策略可查available_cash/total_value/closable_pos等"""
-    acct = {"cash": float(capital), "today": None, "non_closable": 0, "avg_cost": 0.0,
-            "last_price": 0.0, "stats": {"t1_blocked": 0, "t1_adjusted": 0, "cash_rejected": 0}}
+def _patch_account_model(engine, interval, capital, rate, mode="cta", vt_symbols=None):
+    """A股账户模型（CTA/Portfolio统一，对齐rqalpha/聚宽）：资金约束+T+1+策略可查账户属性"""
     is_intraday = interval not in (Interval.DAILY, Interval.WEEKLY)
-    def _inject(strategy, bar_price=0.0):
-        """每根bar更新策略的账户属性（对标聚宽context.portfolio）"""
-        pos = int(strategy.pos)
-        acct["last_price"] = bar_price if bar_price > 0 else acct["last_price"]
-        market_value = pos * acct["last_price"]
-        strategy.available_cash = acct["cash"]  #聚宽portfolio.available_cash
-        strategy.total_value = acct["cash"] + market_value  #聚宽portfolio.total_value
-        strategy.positions_value = market_value  #聚宽portfolio.positions_value
-        strategy.capital = acct["cash"]  #兼容旧代码：capital=可用现金
-        if is_intraday:
-            strategy.closable_pos = max(pos - acct["non_closable"], 0)  #聚宽position.closeable_amount
-        else:
-            strategy.closable_pos = pos
-    _orig_bar = engine.new_bar
-    def _bar_wrap(data):
-        if is_intraday:
-            dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
-            if dt_date and dt_date != acct["today"]:
-                if acct["non_closable"] > 0:
-                    p(f"[T+1] 新交易日{dt_date}，解锁{acct['non_closable']}股")
-                acct["today"] = dt_date; acct["non_closable"] = 0
-        _orig_bar(data)
-        if engine.strategy: _inject(engine.strategy, float(data.close_price))
-    engine.new_bar = _bar_wrap
-    _orig_send = engine.send_order
-    def _send_wrap(strategy, direction, offset, price, volume, stop, lock, net):
-        vol = int(volume); price_f = float(price)
-        if direction == Direction.LONG:  #买入
-            cost = price_f * vol * (1 + rate)
-            if cost > acct["cash"] + 0.01:  #资金不足
-                affordable = int(acct["cash"] / (price_f * (1 + rate)) / 100) * 100
-                if affordable <= 0:
-                    acct["stats"]["cash_rejected"] += 1
-                    p(f"[账户] 买入{vol}股被拒：需{cost:.0f}元，可用{acct['cash']:.0f}元")
-                    return []
-                p(f"[账户] 买入{vol}→调减为{affordable}股(可用现金{acct['cash']:.0f}元)")
-                vol = affordable
-            result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
-            if result:
-                acct["cash"] -= price_f * vol * (1 + rate)
-                if is_intraday: acct["non_closable"] += vol
-                old_pos = int(strategy.pos) - vol
-                if old_pos + vol > 0:
-                    acct["avg_cost"] = (acct["avg_cost"] * old_pos + price_f * vol) / (old_pos + vol)
-                _inject(strategy, price_f)
-            return result
-        else:  #卖出
-            if is_intraday:  #T+1检查
-                closable = max(int(strategy.pos) - acct["non_closable"], 0)
-                if vol > closable:
-                    if closable > 0:
-                        acct["stats"]["t1_adjusted"] += 1
-                        p(f"[T+1] 卖出{vol}→调减为{closable}股(non_closable={acct['non_closable']})")
-                        vol = closable
-                    else:
-                        acct["stats"]["t1_blocked"] += 1
-                        p(f"[T+1] 卖出{vol}股跳过：可卖0股")
-                        return []
-            result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
-            if result:
-                acct["cash"] += price_f * vol * (1 - rate)  #卖出回款（扣佣金）
-                _inject(strategy, price_f)
-            return result
-    engine.send_order = _send_wrap
-    if engine.strategy:
-        _inject(engine.strategy)
-    features = ["available_cash", "total_value", "positions_value", "closable_pos", "capital"]
-    if is_intraday: features.append("T+1")
-    p(f"[账户模型] A股账户模型已启用: {', '.join(features)}")
+    acct = {"cash": float(capital), "today": None, "stats": {"t1_blocked": 0, "t1_adjusted": 0, "cash_rejected": 0}}
+    def _lot_floor(vt_symbol, vol):
+        digits = "".join(c for c in str(vt_symbol or "") if c.isdigit())[:6]
+        if digits.startswith("688"): return int(vol) if int(vol) >= 200 else 0
+        return int(int(vol) / 100) * 100
+    if mode == "cta":
+        acct.update({"non_closable": 0, "avg_cost": 0.0, "last_price": 0.0})
+        def _inject(strategy, bar_price=0.0):
+            pos = int(strategy.pos)
+            acct["last_price"] = bar_price if bar_price > 0 else acct["last_price"]
+            mv = pos * acct["last_price"]
+            strategy.available_cash = acct["cash"]; strategy.total_value = acct["cash"] + mv
+            strategy.positions_value = mv; strategy.capital = acct["cash"]
+            strategy.closable_pos = max(pos - acct["non_closable"], 0) if is_intraday else pos
+        _orig_bar = engine.new_bar
+        def _bar_wrap(data):
+            if is_intraday:
+                dt_date = data.datetime.date() if hasattr(data.datetime, 'date') else None
+                if dt_date and dt_date != acct["today"]:
+                    if acct["non_closable"] > 0: p(f"[T+1] 新交易日{dt_date}，解锁{acct['non_closable']}股")
+                    acct["today"] = dt_date; acct["non_closable"] = 0
+            _orig_bar(data)
+            if engine.strategy: _inject(engine.strategy, float(data.close_price))
+        engine.new_bar = _bar_wrap
+        _orig_send = engine.send_order
+        def _send_wrap(strategy, direction, offset, price, volume, stop, lock, net):
+            sym = getattr(strategy, "vt_symbol", vt_symbols[0] if vt_symbols else "")
+            vol = _lot_floor(sym, int(volume)); price_f = float(price)
+            if vol <= 0: p(f"[账户] {sym} 下单{int(volume)}股不满足最小手数，跳过"); return []
+            if direction == Direction.LONG:
+                cost = price_f * vol * (1 + rate)
+                if cost > acct["cash"] + 0.01:
+                    affordable = _lot_floor(sym, int(acct["cash"] / (price_f * (1 + rate))))
+                    if affordable <= 0:
+                        acct["stats"]["cash_rejected"] += 1; p(f"[账户] 买入{vol}股被拒：需{cost:.0f}元，可用{acct['cash']:.0f}元"); return []
+                    p(f"[账户] 买入{vol}→调减为{affordable}股(可用现金{acct['cash']:.0f}元)"); vol = affordable
+                result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
+                if result:
+                    acct["cash"] -= price_f * vol * (1 + rate)
+                    if is_intraday: acct["non_closable"] += vol
+                    old_pos = int(strategy.pos) - vol
+                    if old_pos + vol > 0: acct["avg_cost"] = (acct["avg_cost"] * old_pos + price_f * vol) / (old_pos + vol)
+                    _inject(strategy, price_f)
+                return result
+            else:
+                if is_intraday:
+                    closable = max(int(strategy.pos) - acct["non_closable"], 0)
+                    if vol > closable:
+                        if closable > 0: acct["stats"]["t1_adjusted"] += 1; p(f"[T+1] 卖出{vol}→调减为{closable}股(non_closable={acct['non_closable']})"); vol = closable
+                        else: acct["stats"]["t1_blocked"] += 1; p(f"[T+1] 卖出{vol}股跳过：可卖0股"); return []
+                vol = _lot_floor(sym, vol)
+                if vol <= 0: p(f"[账户] {sym} 卖出量不满足最小手数，跳过"); return []
+                result = _orig_send(strategy, direction, offset, price, vol, stop, lock, net)
+                if result: acct["cash"] += price_f * vol * (1 - rate); _inject(strategy, price_f)
+                return result
+        engine.send_order = _send_wrap
+        if engine.strategy: _inject(engine.strategy)
+        ft = ["available_cash", "total_value", "positions_value", "closable_pos", "capital"]
+    else:  # portfolio
+        acct.update({"non_closable": {}, "last_prices": {}})
+        def _sync_last_prices():
+            for sym, bar in getattr(engine, "bars", {}).items():
+                try: acct["last_prices"][sym] = float(bar.close_price)
+                except Exception: pass
+        def _inject_p(strategy):
+            pv = 0.0; closable = {}
+            for sym in (vt_symbols or []):
+                pos = int(strategy.get_pos(sym)) if hasattr(strategy, 'get_pos') else 0
+                px = acct["last_prices"].get(sym, 0.0); pv += abs(pos) * px
+                nc = acct["non_closable"].get(sym, 0)
+                closable[sym] = max(pos - nc, 0) if is_intraday else pos
+            strategy.available_cash = acct["cash"]; strategy.total_value = acct["cash"] + pv
+            strategy.positions_value = pv; strategy.capital = acct["cash"]
+            strategy.closable_positions = closable  #per-symbol可卖量
+        _orig_bars = engine.new_bars
+        def _bars_wrap(dt):
+            if is_intraday:
+                dt_date = dt.date() if hasattr(dt, 'date') else None
+                if dt_date and dt_date != acct["today"]:
+                    unlocked = {s: n for s, n in acct["non_closable"].items() if n > 0}
+                    if unlocked: p(f"[T+1] 新交易日{dt_date}，解锁{unlocked}")
+                    acct["today"] = dt_date; acct["non_closable"] = {}
+            _sync_last_prices()
+            _orig_bars(dt)
+            _sync_last_prices()
+            if engine.strategy: _inject_p(engine.strategy)
+        engine.new_bars = _bars_wrap
+        _orig_send = engine.send_order
+        def _send_wrap(strategy, vt_symbol, direction, offset, price, volume, lock, net):
+            vol = _lot_floor(vt_symbol, int(volume)); price_f = float(price)
+            if vol <= 0: p(f"[账户] {vt_symbol} 下单{int(volume)}股不满足最小手数，跳过"); return []
+            if direction == Direction.LONG:
+                cost = price_f * vol * (1 + rate)
+                if cost > acct["cash"] + 0.01:
+                    affordable = _lot_floor(vt_symbol, int(acct["cash"] / (price_f * (1 + rate))))
+                    if affordable <= 0:
+                        acct["stats"]["cash_rejected"] += 1; p(f"[账户] {vt_symbol} 买入{vol}股被拒：需{cost:.0f}元，可用{acct['cash']:.0f}元"); return []
+                    p(f"[账户] {vt_symbol} 买入{vol}→{affordable}股(可用{acct['cash']:.0f}元)"); vol = affordable
+                result = _orig_send(strategy, vt_symbol, direction, offset, price, vol, lock, net)
+                if result:
+                    acct["cash"] -= price_f * vol * (1 + rate)
+                    if is_intraday: acct["non_closable"][vt_symbol] = acct["non_closable"].get(vt_symbol, 0) + vol
+                    acct["last_prices"][vt_symbol] = price_f; _sync_last_prices(); _inject_p(strategy)
+                return result
+            else:
+                if is_intraday:
+                    cur_pos = int(strategy.get_pos(vt_symbol)) if hasattr(strategy, 'get_pos') else 0
+                    nc = acct["non_closable"].get(vt_symbol, 0); closable = max(cur_pos - nc, 0)
+                    if vol > closable:
+                        if closable > 0: acct["stats"]["t1_adjusted"] += 1; p(f"[T+1] {vt_symbol} 卖出{vol}→{closable}股(non_closable={nc})"); vol = closable
+                        else: acct["stats"]["t1_blocked"] += 1; p(f"[T+1] {vt_symbol} 卖出{vol}股跳过：可卖0股"); return []
+                vol = _lot_floor(vt_symbol, vol)
+                if vol <= 0: p(f"[账户] {vt_symbol} 卖出量不满足最小手数，跳过"); return []
+                result = _orig_send(strategy, vt_symbol, direction, offset, price, vol, lock, net)
+                if result: acct["cash"] += price_f * vol * (1 - rate); acct["last_prices"][vt_symbol] = price_f; _sync_last_prices(); _inject_p(strategy)
+                return result
+        engine.send_order = _send_wrap
+        if engine.strategy: _inject_p(engine.strategy)
+        ft = ["available_cash", "total_value", "positions_value", "closable_positions", "capital"]
+    if is_intraday: ft.append("T+1")
+    p(f"[账户模型] A股账户模型已启用({mode}): {', '.join(ft)}")
     return acct
+
+def _guard_strategy_runtime(engine, mode, strategy_cls, capital):
+    """运行前快速兜底：补齐易错API，避免外部策略绕过静态检查后直接跑崩"""
+    s = engine.strategy
+    if not s:
+        return
+    if not hasattr(s, "capital") or getattr(s, "capital", 0) == 0:
+        s.capital = capital
+        p(f"[fix] 策略缺少capital属性，已注入capital={capital}")
+    if mode == "cta":
+        if not hasattr(s, "load_bars"):
+            s.load_bars = lambda days=10, interval=None: s.load_bar(days)
+            p("[fix] CTA策略缺少load_bars，已自动兜底为load_bar")
+        try: src = inspect.getsource(strategy_cls.on_bar)
+        except Exception: src = ""
+        if "update_bar(" not in src and hasattr(s, "am") and hasattr(s.am, "update_bar"):
+            _orig_on_bar = s.on_bar
+            def _on_bar_wrap(bar):
+                s.am.update_bar(bar)
+                return _orig_on_bar(bar)
+            s.on_bar = _on_bar_wrap
+            p("[fix] CTA on_bar缺少am.update_bar，已自动注入运行时兜底")
+    elif mode == "portfolio":
+        if not hasattr(s, "load_bar"):
+            s.load_bar = lambda n=10: s.load_bars(n)
+            p("[fix] Portfolio策略缺少load_bar，已自动兜底为load_bars")
+        try: src = inspect.getsource(strategy_cls.on_bars)
+        except Exception: src = ""
+        if "update_bar(" not in src and hasattr(s, "ams") and isinstance(s.ams, dict):
+            _orig_on_bars = s.on_bars
+            def _on_bars_wrap(bars):
+                for vt_sym, bar in bars.items():
+                    am = s.ams.get(vt_sym)
+                    if am and hasattr(am, "update_bar"): am.update_bar(bar)
+                return _orig_on_bars(bars)
+            s.on_bars = _on_bars_wrap
+            p("[fix] Portfolio on_bars缺少am.update_bar，已自动注入运行时兜底")
+
+def _load_trade_calendar(start, end):
+    """预加载交易日历（set of date strings），失败返回空集"""
+    try:
+        import qgdata as qg
+        token = os.getenv("QGDATA_TOKEN", "")
+        if not token: return set()
+        qg.set_token(token); pro = qg.pro_api(timeout=15.0)
+        s = (start - timedelta(days=30)).strftime("%Y%m%d")
+        e = (end + timedelta(days=30)).strftime("%Y%m%d")
+        df = pro.trade_cal(exchange='SSE', start_date=s, end_date=e, is_open='1')
+        cal = set(df['cal_date'].tolist()) if df is not None and not df.empty else set()
+        p(f"[日历] 交易日历已加载: {len(cal)}个交易日")
+        return cal
+    except Exception as ex:
+        p(f"[日历] 交易日历加载失败({ex})，策略将无法使用trade_calendar。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+        return set()
+
+def _vn2qg(vt_symbol):
+    """vnpy代码转qg代码"""
+    try:
+        s, ex = (vt_symbol or "").split(".")
+        ex_map = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ", "SH": "SH", "SZ": "SZ", "BJ": "BJ"}
+        qex = ex_map.get(ex.upper(), "")
+        return f"{s}.{qex}" if qex else ""
+    except Exception:
+        return ""
+
+def _qg2vn(qg_code):
+    """qg代码转vnpy代码"""
+    try:
+        s, ex = (qg_code or "").split(".")
+        ex_map = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}
+        vex = ex_map.get(ex.upper(), "")
+        return f"{s}.{vex}" if vex else ""
+    except Exception:
+        return ""
+
+def _patch_order_guards(engine, mode, vt_symbols, start, end):
+    """订单守卫：停牌废单(预加载)+涨跌停废单(按日懒加载缓存)+策略可感知下单状态"""
+    s = engine.strategy
+    if not s: return
+    s.last_order_status = {"ok": True, "reason": "init"}
+    if not hasattr(s, "order_reject_log"): s.order_reject_log = []
+    if not hasattr(s, "order_reject_stats"): s.order_reject_stats = {}
+    token = os.getenv("QGDATA_TOKEN", "").strip()
+    pro, suspend_set, limit_cache, warned = None, set(), {}, {"suspend": False, "limit": False}
+    def _now_date(st):
+        dt = getattr(st, "datetime", None) or getattr(engine, "datetime", None) or datetime.now()
+        return dt.strftime("%Y%m%d")
+    def _mark(st, ok, reason, **kw):
+        rec = {"ok": bool(ok), "reason": reason, **kw}; st.last_order_status = rec
+        if ok: return
+        st.order_reject_log = (getattr(st, "order_reject_log", []) + [rec])[-200:]
+        c = getattr(st, "order_reject_stats", {}) or {}; c[reason] = int(c.get(reason, 0)) + 1; st.order_reject_stats = c
+    if token:
+        try:
+            import qgdata as qg
+            qg.set_token(token); pro = qg.pro_api(timeout=15.0)
+            sdate, edate = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+            vt_set = set(vt_symbols or [])
+            try:  #优先批量查询（1次API调用），本地过滤到本次标的
+                df = pro.suspend_d(start_date=sdate, end_date=edate, suspend_type='S', fields="ts_code,trade_date,suspend_type")
+                if df is not None and not df.empty:
+                    for r in df.itertuples(index=False):
+                        vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
+                        t = str(getattr(r, "trade_date", "") or "")
+                        ty = str(getattr(r, "suspend_type", "") or "").upper()
+                        if vt in vt_set and t and ty.startswith("S"): suspend_set.add((t, vt))
+                p(f"[guard] 停牌日历批量加载完成: {len(suspend_set)}条(涉及{len(vt_set)}只标的)")
+            except Exception:  #批量不支持则逐标的查询（降级）
+                for vt in list(vt_set):
+                    qc = _vn2qg(vt)
+                    if not qc: continue
+                    try:
+                        df = pro.suspend_d(ts_code=qc, start_date=sdate, end_date=edate, fields="ts_code,trade_date,suspend_type")
+                        if df is None or df.empty: continue
+                        for r in df.itertuples(index=False):
+                            t = str(getattr(r, "trade_date", "") or ""); ty = str(getattr(r, "suspend_type", "") or "").upper()
+                            if t and (ty.startswith("S") or ty in ("停牌", "S")): suspend_set.add((t, vt))
+                    except Exception as ex:
+                        if not warned["suspend"]: p(f"[guard-warn] 停牌日历加载异常({ex})，降级为不拦截停牌单"); warned["suspend"] = True
+                p(f"[guard] 停牌日历逐标的加载完成: {len(suspend_set)}条")
+        except Exception as ex:
+            p(f"[guard-warn] qgdata初始化失败({ex})，停牌/涨跌停守卫降级。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值")
+    else:
+        p(f"[guard-warn] 未配置QGDATA_TOKEN，停牌/涨跌停守卫降级。获取Token: {QGDATA_RECHARGE_URL}")
+    def _load_limits_for_day(date_s, symbols):
+        if date_s in limit_cache: return limit_cache.get(date_s, {})
+        mp = {}; qcodes = [x for x in {_vn2qg(v) for v in (symbols or [])} if x]
+        if not pro or not qcodes:
+            limit_cache[date_s] = mp; return mp
+        try:
+            try:
+                df = pro.stk_limit(ts_code=",".join(qcodes), trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit")
+                if df is not None and not df.empty:
+                    for r in df.itertuples(index=False):
+                        vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
+                        if vt: mp[vt] = (float(getattr(r, "up_limit", 0) or 0), float(getattr(r, "down_limit", 0) or 0))
+            except Exception:
+                for qc in qcodes:
+                    try:
+                        df = pro.stk_limit(ts_code=qc, trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit")
+                        if df is None or df.empty: continue
+                        for r in df.itertuples(index=False):
+                            vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
+                            if vt: mp[vt] = (float(getattr(r, "up_limit", 0) or 0), float(getattr(r, "down_limit", 0) or 0))
+                    except Exception: pass
+        except Exception as ex:
+            if not warned["limit"]: p(f"[guard-warn] stk_limit({date_s})加载失败({ex})，降级为不拦截涨跌停单"); warned["limit"] = True
+        limit_cache[date_s] = mp; return mp
+    _orig = engine.send_order
+    if mode == "cta":
+        def _wrap(strategy, direction, offset, price, volume, stop, lock, net):
+            sym, date_s = getattr(strategy, "vt_symbol", vt_symbols[0] if vt_symbols else ""), _now_date(strategy)
+            price_f = float(price or 0)
+            if (date_s, sym) in suspend_set:
+                p(f"[guard] 废单(停牌): {sym} {date_s} dir={direction} vol={volume}"); _mark(strategy, False, "suspended", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f); return []
+            lim = _load_limits_for_day(date_s, list({sym, *(vt_symbols or []), *(getattr(strategy, 'vt_symbols', []) or [])})).get(sym)
+            if lim and price_f > 0:
+                up, down = lim
+                if direction == Direction.LONG and up > 0 and price_f >= up:
+                    p(f"[guard] 废单(涨停): {sym} {date_s} price={price_f:.3f} up={up:.3f}"); _mark(strategy, False, "limit_up", symbol=sym, date=date_s, direction="LONG", volume=int(volume), price=price_f, up_limit=up); return []
+                if direction != Direction.LONG and down > 0 and price_f <= down:
+                    p(f"[guard] 废单(跌停): {sym} {date_s} price={price_f:.3f} down={down:.3f}"); _mark(strategy, False, "limit_down", symbol=sym, date=date_s, direction="SHORT", volume=int(volume), price=price_f, down_limit=down); return []
+            ret = _orig(strategy, direction, offset, price, volume, stop, lock, net)
+            if ret: _mark(strategy, True, "submitted", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f, order_count=len(ret))
+            else: _mark(strategy, False, "engine_reject", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f)
+            return ret
+        engine.send_order = _wrap
+    else:
+        def _wrap(strategy, vt_symbol, direction, offset, price, volume, lock, net):
+            sym, date_s = vt_symbol, _now_date(strategy); price_f = float(price or 0)
+            if (date_s, sym) in suspend_set:
+                p(f"[guard] 废单(停牌): {sym} {date_s} dir={direction} vol={volume}"); _mark(strategy, False, "suspended", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f); return []
+            lim = _load_limits_for_day(date_s, list({sym, *(vt_symbols or []), *(getattr(strategy, 'vt_symbols', []) or [])})).get(sym)
+            if lim and price_f > 0:
+                up, down = lim
+                if direction == Direction.LONG and up > 0 and price_f >= up:
+                    p(f"[guard] 废单(涨停): {sym} {date_s} price={price_f:.3f} up={up:.3f}"); _mark(strategy, False, "limit_up", symbol=sym, date=date_s, direction="LONG", volume=int(volume), price=price_f, up_limit=up); return []
+                if direction != Direction.LONG and down > 0 and price_f <= down:
+                    p(f"[guard] 废单(跌停): {sym} {date_s} price={price_f:.3f} down={down:.3f}"); _mark(strategy, False, "limit_down", symbol=sym, date=date_s, direction="SHORT", volume=int(volume), price=price_f, down_limit=down); return []
+            ret = _orig(strategy, vt_symbol, direction, offset, price, volume, lock, net)
+            if ret: _mark(strategy, True, "submitted", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f, order_count=len(ret))
+            else: _mark(strategy, False, "engine_reject", symbol=sym, date=date_s, direction=str(direction), volume=int(volume), price=price_f)
+            return ret
+        engine.send_order = _wrap
+    p("[guard] 订单守卫已启用: 停牌废单 + 涨跌停按日懒加载缓存 + last_order_status")
 
 # ========== 回测 ==========
 def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, rate, slippage, size, pricetick, strategy_params, total_stages):
@@ -316,15 +597,12 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
             sizes={s: size for s in vt_symbols}, priceticks={s: pricetick for s in vt_symbols}, capital=capital)
         engine.add_strategy(strategy_cls, strategy_params)
     _patch_lot_compliance(engine, vt_symbols, mode)
-    if mode == "cta":
-        _patch_account_model(engine, interval, capital, rate)
-    if mode == "cta" and engine.strategy:
-        if not hasattr(engine.strategy, 'load_bars'):
-            engine.strategy.load_bars = lambda days=10, interval=None: engine.strategy.load_bar(days)  #兜底：CTA策略误用load_bars时降级为load_bar
-            p("[fix] CTA策略缺少load_bars，已自动兜底为load_bar")
-        if not hasattr(engine.strategy, 'capital') or getattr(engine.strategy, 'capital', 0) == 0:
-            engine.strategy.capital = capital  #兜底：注入capital参数
-            p(f"[fix] 策略缺少capital属性，已注入capital={capital}")
+    _patch_account_model(engine, interval, capital, rate, mode, vt_symbols)
+    _patch_order_guards(engine, mode, vt_symbols, start, end)
+    _guard_strategy_runtime(engine, mode, strategy_cls, capital)
+    trade_cal = _load_trade_calendar(start, end)
+    if trade_cal and engine.strategy:
+        engine.strategy.trade_calendar = trade_cal  # 策略可用 date_str in self.trade_calendar 判断交易日
     engine.load_data()
     bar_count = len(engine.history_data) if mode == "cta" else len(getattr(engine, "dts", []) or [])
     p(f"  引擎参数: vt_symbols={vt_symbols} interval={interval} start={start} end={end}")
@@ -346,7 +624,7 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
                 p(f"  [monitor] 沪深300基准已推送({len(bench_dates)}点)")
         except Exception as e:
             p(f"  [monitor] 基准推送失败: {e}")
-    state = _attach_progress(engine, mode, total_stages, capital, size)
+    state = _attach_progress(engine, mode, total_stages, capital, size, vt_symbols)
     stage(3, total_stages, "running", f"{bar_count}根K线已加载，回放中...")
     engine.run_backtesting()
     if state.get("err"):
@@ -384,25 +662,7 @@ def print_stats(stats, total_stages):
 # ========== 推送精确净值到monitor ==========
 
 def _extract_trades(engine):
-    trades = list(getattr(engine, "trades", {}).values())
-    trade_list, pos_map, cost_map = [], {}, {} # 按标的分组跟踪仓位，兼容CTA/Portfolio
-    for t in trades:
-        dt_str = t.datetime.strftime("%Y-%m-%d") if hasattr(t.datetime, "strftime") else str(t.datetime)[:10]
-        direction = "BUY" if t.direction == Direction.LONG else "SELL"
-        price, volume, pnl = float(t.price), float(t.volume), ""
-        sym = getattr(t, 'vt_symbol', '') or ''
-        pos, avg_cost = pos_map.get(sym, 0.0), cost_map.get(sym, 0.0)
-        if direction == "BUY":
-            new_pos = pos + volume
-            avg_cost = (avg_cost * pos + price * volume) / new_pos if new_pos > 0 else 0
-            pos = new_pos
-        else:
-            if avg_cost > 0: pnl = f"{(price - avg_cost) * volume:.2f}"
-            pos = max(pos - volume, 0)
-            if pos == 0: avg_cost = 0
-        pos_map[sym], cost_map[sym] = pos, avg_cost
-        trade_list.append({"date": dt_str, "symbol": sym, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}", "pnl": pnl})
-    return trade_list
+    return _serialize_trade_rows(list(getattr(engine, "trades", {}).values()))
 
 def _extract_positions(trade_list):
     """从交易记录推算最终持仓"""

@@ -31,6 +31,10 @@ metadata:
 
 路由由 `parse_requirement()` 自动判定并写入 `parsed["mode"]`，agent 生成策略代码时必须使用对应基类。
 
+**Portfolio 引擎驱动约束**：Portfolio 回测引擎仅支持 DAILY 和分钟级驱动。周级策略用 `--interval DAILY`，在 `on_bars` 中按 `bar.datetime.weekday()==0`（周一）判断调仓日；周线指标直接用 `pro.weekly()` 获取，无需从日线合成。
+
+**股票池所有权契约（强制）**：股票池由 `--symbols` 参数唯一定义 → 引擎加载数据 → 策略通过 `self.vt_symbols` 接收。策略代码 `__init__` 中**禁止覆盖 `vt_symbols`**，必须使用引擎传入的列表。所有标的代码使用 vnpy 格式（`600519.SSE`/`000858.SZSE`），不可使用 qgdata 格式（`.SH/.SZ`）。选股逻辑在 `on_bars(bars)` 中基于 `self.vt_symbols` 遍历和筛选。
+
 ### 模拟/实盘检测（独立流程，不走三轮协议）
 
 用户提及 `模拟`/`实盘`/`QMT` 时触发：
@@ -157,11 +161,17 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
    - **账户属性（引擎自动注入，策略直接用）**：
      - `self.available_cash` — 可用现金（买入扣减，卖出回款）
      - `self.total_value` — 账户总值（现金+持仓市值）
-     - `self.closable_pos` — 可卖数量（T+1 自动扣减当日买入）
+     - `self.closable_pos` — CTA可卖数量（T+1 自动扣减当日买入）
+     - `self.closable_positions` — Portfolio per-symbol可卖量dict（`self.closable_positions.get(vt_symbol, 0)`）
      - `self.capital` — 等于 available_cash（兼容）
+     - `self.trade_calendar` — 交易日历（set of "YYYYMMDD"），可用 `date_str in self.trade_calendar` 判断交易日
+     - `self.last_order_status` — 最近一次下单结果（`{"ok":True/False,"reason":"...","symbol":"..."}`）
+     - `self.order_reject_log` — 最近200条被拒订单记录（停牌/涨跌停/资金不足等）
    - **资金不足兜底**：引擎会自动调减买入量到可用现金能买的最大手数，无需策略手动检查
+   - **停牌/涨跌停兜底**：引擎自动拦截停牌日下单和触及涨跌停价格的委托，返回空列表。**策略判断下单是否成功应优先检查 `buy()/sell()` 返回值**（空列表=被拒），而非假设一定成功
    - **交易所合规（强制）**：沪深主板/创业板 100 股整数倍，科创板(688xxx) 200 股起步+1 股递增（205 股合法）
    - **ArrayManager API**：均线用 `am.sma()`，禁止用 `am.ma()`（vnpy 不存在此方法）
+   - **CTA 必须在 `on_bar` 开头调用 `am.update_bar(bar)`**：否则 ArrayManager 永远不会 `inited`，导致全程 0 交易。引擎有运行时兜底但不能依赖
    - 写入 `${QUANTCLAW_ROOT}/strategies/{module_name}.py`
 
 2. **编译校验**（最多 3 轮 compile-fix 循环）：
@@ -172,13 +182,14 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
    - 编译失败 → 读取错误信息，LLM 修复代码，重写文件，重新编译
    - 超过 3 轮仍失败 → 告知用户并附错误信息，结束本轮
 
-3. **提交回测**：
+3. **提交回测**（`--symbols` 必须包含策略代码中所有会交易的标的，引擎仅为 `--symbols` 列表加载数据）：
 ```bash
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" submit \
   --requirement "{用户原始需求}" \
   --strategy-file "${QUANTCLAW_ROOT}/strategies/{module_name}.py" \
   --strategy-module "{module_name}" \
   --strategy-class "{class_name}" \
+  --symbols "{策略中所有vt_symbol逗号分隔}" \
   --monitor-public-base "${MONITOR_PUBLIC_BASE:-}" \
   --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8767}" \
   --timeout-sec 1200

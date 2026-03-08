@@ -60,6 +60,8 @@ KEYWORD_API_RULES: Dict[str, List[str]] = {
 }
 
 # Keywords that usually imply out-of-scope or ambiguous requirement.
+QGDATA_RECHARGE_URL = "https://quantgo.ai/data"
+
 UNSUPPORTED_HINTS: Dict[str, str] = {
     "期权": "当前编排器默认股票策略，期权需要单独执行链路。",
     "期货": "当前编排器默认股票策略，期货需要单独执行链路。",
@@ -68,22 +70,23 @@ UNSUPPORTED_HINTS: Dict[str, str] = {
 }
 
 
-def list_runtime_apis() -> Set[str]:
+def list_runtime_apis() -> tuple[Set[str], str]:
+    """返回 (可用API集合, 警告信息)。警告非空表示Token问题。"""
     token = os.getenv("QGDATA_TOKEN", "")
     if not token:
-        return set()
+        return set(), f"未配置QGDATA_TOKEN，数据能力检查将使用文档声明的API列表。获取Token: {QGDATA_RECHARGE_URL}"
     try:
         import qgdata as qg  # type: ignore
         qg.set_token(token)
         pro = qg.pro_api(timeout=10.0)
         apis = pro.list_apis(enabled_only=True)
         if isinstance(apis, list):
-            return {str(x) for x in apis}
+            return {str(x) for x in apis}, ""
         if isinstance(apis, dict):
-            return {str(k) for k in apis.keys()}
-    except Exception:
-        return set()
-    return set()
+            return {str(k) for k in apis.keys()}, ""
+    except Exception as exc:
+        return set(), f"qgdata API能力探测失败({type(exc).__name__}: {exc})。如Token额度不足请到 {QGDATA_RECHARGE_URL} 充值"
+    return set(), ""
 
 
 @dataclass
@@ -122,7 +125,7 @@ def evaluate_requirement(requirement: str) -> CapabilityResult:
         if keyword.lower() in text:
             unsupported.append(f"{keyword}: {reason}")
 
-    runtime_apis = list_runtime_apis()
+    runtime_apis, token_warn = list_runtime_apis()
     available = runtime_apis if runtime_apis else DOCUMENTED_APIS
     missing = sorted(api for api in required if api not in available)
 
@@ -138,14 +141,15 @@ def evaluate_requirement(requirement: str) -> CapabilityResult:
         )
 
     if missing:
+        sug = f"当前需求依赖的部分数据接口不可用({', '.join(missing)})。请调整需求，或到 {QGDATA_RECHARGE_URL} 升级套餐启用缺失接口。"
         return CapabilityResult(
             ok=False,
             status="clarification_needed",
             required_apis=sorted(required),
             missing_apis=missing,
             matched_rules=matched_rules,
-            unsupported_reasons=[],
-            suggestion="当前需求依赖的部分数据接口不可用。请调整需求，或先启用缺失接口。",
+            unsupported_reasons=[token_warn] if token_warn else [],
+            suggestion=sug,
         )
 
     return CapabilityResult(
@@ -154,8 +158,8 @@ def evaluate_requirement(requirement: str) -> CapabilityResult:
         required_apis=sorted(required),
         missing_apis=[],
         matched_rules=matched_rules,
-        unsupported_reasons=[],
-        suggestion="数据能力检查通过，可启动编排。",
+        unsupported_reasons=[token_warn] if token_warn else [],
+        suggestion="数据能力检查通过，可启动编排。" + (f" 注意: {token_warn}" if token_warn else ""),
     )
 
 

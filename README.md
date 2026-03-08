@@ -105,7 +105,7 @@ vim QMT-TradingClaw/.env
 python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor
 ```
 
-> `config-doctor` 会逐项检查 QUANTCLAW_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。
+> `config-doctor` 会逐项检查 QUANTCLAW_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。全市场/大样本回测默认最多抽样 500 只股票，可用 `QC_POOL_MAX_STOCKS` 调整。
 
 <details>
 <summary>如果不想用 .env 文件，也可以直接 export（点击展开）</summary>
@@ -118,6 +118,7 @@ export PYTHON_BIN="python3"
 export QGDATA_TOKEN="你的qgdata_token"
 export MONITOR_PUBLIC_BASE="http://你的公网IP或域名"
 export ORCH_MONITOR_PORT_CANDIDATES="8767"
+export QC_POOL_MAX_STOCKS="500"
 ```
 
 ### Windows（PowerShell）
@@ -128,6 +129,7 @@ $env:PYTHON_BIN = "python"
 $env:QGDATA_TOKEN = "你的qgdata_token"
 $env:MONITOR_PUBLIC_BASE = "http://你的公网IP或域名"
 $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
+$env:QC_POOL_MAX_STOCKS = "500"
 ```
 
 </details>
@@ -179,6 +181,8 @@ $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 
 - 检查 `QGDATA_TOKEN` 是否正确、是否过期。
 - 检查 qgdata 账户是否已开通 Pro，且当前策略涉及的接口已授权。
+- 如额度用尽或需要升级，前往 [https://quantgo.ai/data](https://quantgo.ai/data) 充值。
+- 系统会在监控页显示⚠️警告并附带充值链接，点击即可跳转。
 
 ### 3）为什么策略没跑起来，提示 LLM 相关错误
 
@@ -213,6 +217,12 @@ python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py qmt-check
 | 周线 | `WEEKLY` | |
 
 分钟级回测自动启用 A 股 T+1 合规兜底：当日买入的股数标记"锁定"，当日卖出信号自动扣减锁定部分，仅可卖出昨日及以前的持仓。
+
+订单风控兜底（CTA/Portfolio 均生效）：
+- 停牌检查：回测启动时预加载回测区间内停牌日历，停牌日下单直接废单（`suspended`）。
+- 涨跌停检查：按交易日懒加载 `stk_limit`，当日首次下单才拉取一次，当日后续下单走内存缓存；命中涨跌停价格约束废单（`limit_up/limit_down`）。
+- 降级策略：`stk_limit` 拉取失败不阻塞回测，仅输出 warn；有数据严格校验，无数据按原逻辑执行。
+- 策略可感知：策略实例注入 `last_order_status`、`order_reject_log`、`order_reject_stats`，避免“以为下单成功”。
 
 ### 7）监控页有哪些面板
 
