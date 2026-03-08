@@ -41,10 +41,11 @@ def broadcast(event, data):
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>策略监控</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css">
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js"></script>
+<script>window.__cdn_ok=false;</script>
+<script src="https://registry.npmmirror.com/echarts/5.5.1/files/dist/echarts.min.js" onload="window.__cdn_ok=true" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+<link rel="stylesheet" href="https://registry.npmmirror.com/highlight.js/11.9.0/files/styles/atom-one-light.min.css" onerror="this.href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css'">
+<script src="https://registry.npmmirror.com/highlight.js/11.9.0/files/lib/highlight.min.js" onerror="this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
+<script src="https://registry.npmmirror.com/highlight.js/11.9.0/files/lib/languages/python.min.js" onerror="this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(180deg,#e8f4f8,#f0f9ff);min-height:100vh;color:#1e293b}
@@ -194,8 +195,8 @@ function setTL(n,st){
   })
 }
 function addLog(m){const e=document.getElementById('logs');const ml=m.replace(/(https?:\\/\\/[^\\s<]+)/g,'<a href="$1" target="_blank" style="color:#2563eb">$1</a>');e.innerHTML+='<div>['+new Date().toLocaleTimeString()+'] '+ml+'</div>';e.scrollTop=e.scrollHeight}
-const chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});
-const dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
+let chart=null,dailyChart=null;
+try{chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'})}catch(e){addLog('⚠️ 图表库加载失败('+e.message+')，数据正常推送中');}
 const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',
   tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14],shadowBlur:8,shadowColor:'rgba(0,0,0,.1)',formatter:function(ps){var h=ps[0].axisValue;ps.forEach(function(p){if(p.value!=null){h+='<br/>'+p.marker+p.seriesName+': '+p.value.toFixed(4)+' <b>('+((p.value-1)*100).toFixed(2)+'%)</b>'}});return h}},
   legend:{data:['策略净值','沪深 300 基准'],top:10,right:16,textStyle:{color:'#64748b',fontSize:12}},
@@ -206,15 +207,15 @@ const chartOpt={animation:true,animationDuration:300,animationEasing:'cubicOut',
     {name:'策略净值',type:'line',data:[],smooth:.25,lineStyle:{width:3,color:'#2563eb'},areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(37,99,235,.15)'},{offset:1,color:'rgba(37,99,235,0)'}]}},symbol:'none',symbolSize:6},
     {name:'沪深 300 基准',type:'line',data:[],smooth:.25,lineStyle:{width:2,color:'#dc2626',type:'dashed'},symbol:'none'}
   ]};
-chart.setOption(chartOpt);
+if(chart)chart.setOption(chartOpt);
 const dailyOpt={animation:true,animationDuration:300,
   tooltip:{trigger:'axis',backgroundColor:'rgba(255,255,255,.98)',borderColor:'#e2e8f0',textStyle:{color:'#1e293b',fontSize:13},padding:[10,14]},
   grid:{left:56,right:24,top:36,bottom:48},
   xAxis:{type:'category',data:[],axisLabel:{color:'#94a3b8',fontSize:10},axisLine:{lineStyle:{color:'#e2e8f0'}}},
   yAxis:{type:'value',name:'日收益%',nameTextStyle:{color:'#64748b'},axisLabel:{color:'#64748b',fontSize:11,formatter:v=>v.toFixed(2)+'%'},axisLine:{lineStyle:{color:'#e2e8f0'}},splitLine:{lineStyle:{color:'#f1f5f9'}}},
   series:[{name:'日收益',type:'bar',data:[],itemStyle:{color:function(p){return p.data>=0?'#16a34a':'#dc2626'}},barWidth:'60%',showBackground:true,backgroundStyle:{color:'rgba(0,0,0,.02)'}}]};
-dailyChart.setOption(dailyOpt);
-window.addEventListener('resize',()=>{chart.resize();dailyChart.resize()});
+if(dailyChart)dailyChart.setOption(dailyOpt);
+window.addEventListener('resize',()=>{if(chart)chart.resize();if(dailyChart)dailyChart.resize()});
 var STATE_DONE=false;
 let dateIdx={},tradeData=[],currentPage=1,pageSize=10;
 function renderTrades(){
@@ -244,7 +245,7 @@ es.addEventListener('requirement',e=>{const d=JSON.parse(e.data);setBadge('b1','
 es.addEventListener('code',e=>{const d=JSON.parse(e.data);setBadge('b2','success');
   const el=document.getElementById('c2');el.classList.remove('empty');
   el.innerHTML='<div class="code-wrap"><div class="code-h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>📄 '+(d.filename||'strategy.py')+' · 已保存至绝对路径</div><pre class="code-block"><code class="language-python">'+esc(d.content)+'</code></pre></div>';
-  hljs.highlightAll()});
+  try{hljs.highlightAll()}catch(e){}});
 es.addEventListener('progress',e=>{const d=JSON.parse(e.data);
   if(d.run_id)document.getElementById('rid').textContent='run: '+d.run_id;
   const pct=parseInt(d.pct)||0;document.getElementById('bar3').style.width=pct+'%';
@@ -254,24 +255,24 @@ es.addEventListener('progress',e=>{const d=JSON.parse(e.data);
 let allDates=[],benchMap={};
 es.addEventListener('init_axis',e=>{const d=JSON.parse(e.data);dateIdx={};allDates=d.dates;
   chartOpt.xAxis.data=[];chartOpt.series[0].data=[];chartOpt.series[1].data=[];
-  d.dates.forEach((dt,i)=>dateIdx[dt]=i);chart.setOption(chartOpt,true);setBadge('b3','running')});
+  d.dates.forEach((dt,i)=>dateIdx[dt]=i);if(chart)chart.setOption(chartOpt,true);setBadge('b3','running')});
 es.addEventListener('point',e=>{const d=JSON.parse(e.data);
   const nav=parseFloat(d.nav);
   chartOpt.xAxis.data.push(d.dt);chartOpt.series[0].data.push(nav);
   chartOpt.series[1].data.push(benchMap[d.dt]||null);
-  chart.setOption(chartOpt)});
+  if(chart)chart.setOption(chartOpt)});
 es.addEventListener('bench_data',e=>{const d=JSON.parse(e.data);
   if(d.dates&&d.bench){d.dates.forEach((dt,i)=>{benchMap[dt]=d.bench[i]})}});
 es.addEventListener('final_chart',e=>{const d=JSON.parse(e.data);
   chartOpt.xAxis.data=d.dates;chartOpt.series[0].data=d.navs;chartOpt.series[1].data=d.bench||[];
-  chart.setOption(chartOpt,true);setBadge('b3','success');document.getElementById('bar3').style.width='100%';
+  if(chart)chart.setOption(chartOpt,true);setBadge('b3','success');document.getElementById('bar3').style.width='100%';
   const daily=[];const dailyDates=[];
   for(let i=1;i<d.navs.length&&i<d.dates.length;i++){
     const prev=d.navs[i-1]||1,curr=d.navs[i];
     daily.push(((curr-prev)/prev*100).toFixed(3));
     dailyDates.push(d.dates[i]);
   }
-  dailyOpt.xAxis.data=dailyDates;dailyOpt.series[0].data=daily.map(v=>parseFloat(v));dailyChart.setOption(dailyOpt,true);
+  dailyOpt.xAxis.data=dailyDates;dailyOpt.series[0].data=daily.map(v=>parseFloat(v));if(dailyChart)dailyChart.setOption(dailyOpt,true);
   setBadge('b4','success')});
 es.addEventListener('stats',e=>{const d=JSON.parse(e.data);setBadge('b5','success');
   const el=document.getElementById('c5');el.classList.remove('empty');
