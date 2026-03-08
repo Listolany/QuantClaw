@@ -41,11 +41,10 @@ def broadcast(event, data):
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>策略监控</title>
-<script>window.__cdn_ok=false;</script>
-<script src="https://registry.npmmirror.com/echarts/5.5.1/files/dist/echarts.min.js" onload="window.__cdn_ok=true" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
-<link rel="stylesheet" href="https://registry.npmmirror.com/highlight.js/11.9.0/files/styles/atom-one-light.min.css" onerror="this.href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css'">
-<script src="https://registry.npmmirror.com/highlight.js/11.9.0/files/lib/highlight.min.js" onerror="this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
-<script src="https://registry.npmmirror.com/highlight.js/11.9.0/files/lib/languages/python.min.js" onerror="this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+<link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/styles/atom-one-light.min.css" onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css'">
+<script src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/highlight.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
+<script src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/languages/python.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(180deg,#e8f4f8,#f0f9ff);min-height:100vh;color:#1e293b}
