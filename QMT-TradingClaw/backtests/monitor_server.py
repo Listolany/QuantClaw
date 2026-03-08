@@ -574,6 +574,31 @@ MONITOR_MAX_IDLE_SEC = int(os.environ.get("MONITOR_MAX_IDLE_SEC", "1800"))  # 30
 MONITOR_DONE_KEEPALIVE_SEC = int(os.environ.get("MONITOR_DONE_KEEPALIVE_SEC", "600"))  # done后保留10min供用户查看
 
 
+def _recover_state(run_id):
+    """启动时从 state.json 恢复已完成/失败的 run 状态，避免重启丢数据"""
+    if not run_id: return
+    import glob, pathlib
+    for d in [pathlib.Path(__file__).parent / "orchestrator_runs" / run_id]:
+        sf = d / "state.json"
+        if not sf.exists(): continue
+        try:
+            s = json.loads(sf.read_text())
+            if s.get("status") not in ("failed", "completed", "done"): return
+            with LOCK:
+                STATE["run_id"] = run_id; STATE["_ts"] = int(time.time())
+                if s.get("status") == "failed": STATE["status"] = "failed"; STATE["done"] = True; STATE["pct"] = 100
+                elif s.get("status") in ("completed", "done"): STATE["status"] = "done"; STATE["done"] = True; STATE["pct"] = 100
+                req = s.get("payload", {})
+                STATE["requirement"] = {k: v for k, v in req.items() if k in ("requirement", "symbols", "fast_window", "slow_window", "interval", "direction", "mode", "run_id")}
+                if isinstance(STATE["requirement"].get("symbols"), list): STATE["requirement"]["symbols"] = f"共{len(STATE['requirement']['symbols'])}只标的"
+                errs = s.get("errors", [])
+                if errs:
+                    e = errs[-1]; STATE["error"] = {"error_type": e.get("error_type", ""), "step": e.get("step", ""), "message": e.get("message", ""), "traceback": e.get("traceback", "")}
+                for step_k, step_v in s.get("steps", {}).items():
+                    STATE["steps"][step_k] = {"step": step_k, "status": step_v.get("status", ""), "title": step_v.get("detail", ""), "msg": ""}
+            print(f"[monitor] recovered state from {sf} (status={s.get('status')})", flush=True)
+        except Exception as e: print(f"[monitor] state recovery failed: {e}", flush=True)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -582,6 +607,7 @@ def main():
     args = ap.parse_args()
     _kill_port(args.port)
     STATE["run_id"] = args.run_id
+    _recover_state(args.run_id)
     srv = ThreadedHTTPServer((args.host, args.port), Handler)
     shown_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
     print(f"[monitor] http://{shown_host}:{args.port}/runs/{args.run_id}", flush=True)
