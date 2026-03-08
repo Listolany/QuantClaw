@@ -407,6 +407,25 @@ quant-claw-push/
 
 ---
 
+### #14 — 监控页"连接中..."永久卡死（CDN阻塞级联故障）
+**日期**：2026-03-08  
+**现象**：多次回测（包括 `20260308_141253`）监控页永久显示"连接中..."，后端 SSE/API 完全正常  
+**5-Why 根因**：
+1. 页面显示"连接中..."不变 → EventSource 和 `_pollState` 从未执行
+2. 为什么没执行？ → 同一 `<script>` 块中 `echarts.init()` 在第 197 行抛异常
+3. 为什么 echarts 抛异常？ → `echarts` 全局变量为 `undefined`（CDN 脚本未加载完成）
+4. 为什么 CDN 未加载？ → jsdelivr CDN 在中国大陆经常超时/阻塞
+5. **核心根因：页面 `<head>` 中 echarts CDN 使用 jsdelivr（大陆不稳定），阻塞加载失败后 `echarts.init()` 无 try-catch → 级联中断同 script 块中所有后续代码（SSE、轮询、事件监听）**
+
+**修复**：
+- CDN 主源切 npmmirror（国内镜像），onerror 回退 jsdelivr
+- `echarts.init()` / `dailyChart.init()` 包 try-catch，图表挂了不影响通信
+- 所有 `chart.setOption()` / `chart.resize()` 加 null 保护
+- `hljs.highlightAll()` 加 try-catch
+- 确保 EventSource + 轮询 + 状态更新在图表失败时仍能正常工作
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |
