@@ -243,7 +243,8 @@ es.addEventListener('requirement',e=>{const d=JSON.parse(e.data);setBadge('b1','
   const el=document.getElementById('c1');el.classList.remove('empty');
   const km={symbols:'标的',fast_window:'快线周期',slow_window:'慢线周期',interval:'K线周期',direction:'方向',mode:'策略模式',requirement:'需求描述',run_id:'运行ID'};
   const vm={bullish:'看涨',bearish:'看跌',DAILY:'日线',MINUTE:'分钟线',HOUR:'小时线',WEEKLY:'周线',cta:'CTA单标的',portfolio:'Portfolio组合'};
-  let h='<div class="req-grid">';for(const[k,v] of Object.entries(d)){const lbl=km[k]||k;const val=Array.isArray(v)?v.join(', '):(vm[v]||v);h+='<div class="req-item"><div class="k">'+lbl+'</div><div class="v">'+val+'</div></div>'}
+  const isP=d.mode==='portfolio';const skip=isP?new Set(['fast_window','slow_window','direction','pool_warning','data_blocked','start','end']):new Set(['pool_warning','data_blocked','start','end']);
+  let h='<div class="req-grid">';for(const[k,v] of Object.entries(d)){if(skip.has(k)||!v)continue;const lbl=km[k]||k;const val=Array.isArray(v)?v.join(', '):(vm[v]||v);h+='<div class="req-item"><div class="k">'+lbl+'</div><div class="v">'+val+'</div></div>'}
   el.innerHTML=h+'</div>'});
 es.addEventListener('code',e=>{const d=JSON.parse(e.data);setBadge('b2','success');
   const el=document.getElementById('c2');el.classList.remove('empty');
@@ -588,7 +589,7 @@ def _recover_state(run_id):
                 STATE["run_id"] = run_id; STATE["_ts"] = int(time.time())
                 if s.get("status") == "failed": STATE["status"] = "failed"; STATE["done"] = True; STATE["pct"] = 100
                 elif s.get("status") in ("completed", "done"): STATE["status"] = "done"; STATE["done"] = True; STATE["pct"] = 100
-                req = s.get("payload", {})
+                req = {**s.get("payload", {}), **s.get("payload", {}).get("parsed", {})}
                 STATE["requirement"] = {k: v for k, v in req.items() if k in ("requirement", "symbols", "fast_window", "slow_window", "interval", "direction", "mode", "run_id")}
                 if isinstance(STATE["requirement"].get("symbols"), list): STATE["requirement"]["symbols"] = f"共{len(STATE['requirement']['symbols'])}只标的"
                 errs = s.get("errors", [])
