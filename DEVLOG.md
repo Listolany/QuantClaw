@@ -468,6 +468,15 @@ quant-claw-push/
 
 ---
 
+### #19 — LLM传池名"沪深300"为symbol导致backtest_runner IndexError (run 20260308_162258)
+**日期**：2026-03-09  
+**现象**：`IndexError: list index out of range` at `backtest_runner.py:874`（`s.split(".")[1]`）  
+**根因链**：LLM agent 传 `--symbols 沪深300`（池名不是代码）→ `normalize_symbol("沪深300")` 不匹配任何模式但原样返回 → `symbols_override` 非空跳过 `_resolve_stock_pool()` → `backtest_runner` 拿到无 `.` 的字符串崩溃  
+**修复**：①`normalize_symbol()` 对非合法代码格式返回空串；②`parse_requirement()` 过滤空值后若无有效代码则走正常池解析；③`backtest_runner.py` 对无 `.` 的 symbol 防御跳过  
+**验证**：`parse_requirement("沪深300成分股均线收敛选股策略", "沪深300", "")` → 正确解析出300只成分股，mode=portfolio
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |
