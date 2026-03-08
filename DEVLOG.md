@@ -450,6 +450,15 @@ quant-claw-push/
 
 ---
 
+### #17 — 监控页始终"连接中..."（SSE/轮询/图表全部失效）
+**日期**：2026-03-08  
+**现象**：监控页加载后永远停留在"连接中..."，SSE、轮询、图表均无反应，后端 `/api/state` 和 SSE 流完全正常  
+**根因**：`monitor_server.py` L196 `addLog()` 函数中正则 `/(https?:\\/\\/[^\\s<]+)/g` 在 Python `r"""..."""` raw string 下，`\\` 原样输出到浏览器，JS 引擎解析 `\\` 为转义反斜杠后遇到 `/` 提前结束正则，剩余文本被当作非法 flags → `Invalid regular expression flags`。这是**解析级错误**，整个 `<script>` 块被拒绝，所有 JS 从未执行  
+**修复**：`\\/` → `\/`，`\\s` → `\s`（raw string 中单反斜杠即可）  
+**教训**：Python raw string 内嵌 JS 正则时，`\` 不会被 Python 转义但会被 JS 引擎解析，需按 JS 正则语法而非 Python 字符串转义
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |
