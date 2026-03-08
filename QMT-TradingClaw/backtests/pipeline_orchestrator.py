@@ -715,11 +715,30 @@ def detect_strategy_class(filepath: Path) -> str:
         return ""
 
 
+_IMPORT_REWRITES = [ #(正则, 替换目标) — 自动修正LLM生成的错误import路径
+    (re.compile(r"from\s+vnpy\.app\.cta_strategy\s+import\s+"), "from vnpy_ctastrategy import "),
+    (re.compile(r"from\s+vnpy\.app\.portfolio_strategy\s+import\s+"), "from vnpy_portfoliostrategy import "),
+    (re.compile(r"from\s+vnpy\.app\.\w+\s+import\s+"), "from vnpy_ctastrategy import "), #兜底
+]
+
+def _autofix_imports(source: str, mode: str = "cta") -> tuple[str, list[str]]:
+    """自动修复已知错误import路径，返回(修复后源码, 修复日志列表)"""
+    fixes = []
+    for pat, repl in _IMPORT_REWRITES:
+        if pat.search(source):
+            old_line = pat.search(source).group()
+            if mode == "portfolio" and "vnpy_ctastrategy" in repl: repl = repl.replace("vnpy_ctastrategy", "vnpy_portfoliostrategy")
+            source = pat.sub(repl, source)
+            fixes.append(f"{old_line.strip()} → {repl.strip()}")
+    return source, fixes
+
 def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
     """策略代码静态检查——在py_compile之后、submit之前执行。blocker=必崩抛异常，warning=仅日志(运行时有兜底)"""
     warnings, blockers = [], []
     if "vnpy.trading." in source:
         blockers.append("错误包路径 vnpy.trading.*，应为 vnpy.trader.*")
+    if re.search(r"from\s+vnpy\.app\.", source): #autofix未覆盖的vnpy.app.*残留
+        blockers.append("错误包路径 vnpy.app.*，此环境应使用 vnpy_ctastrategy/vnpy_portfoliostrategy")
     if "am.ma(" in source:
         blockers.append("vnpy无am.ma()方法，应使用am.sma()")
     if mode == "portfolio" and re.search(r"from\s+vnpy_portfoliostrategy\s+import\s+.*\bSignal\b", source):
@@ -1423,6 +1442,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
             strategy_file_path = Path(ext_strategy_file)
             source = strategy_file_path.read_text(encoding="utf-8")
             bt_mode = parsed.get("mode", "cta")
+            source, import_fixes = _autofix_imports(source, bt_mode)
+            if import_fixes: strategy_file_path.write_text(source, encoding="utf-8"); print(f"[autofix] import修正: {'; '.join(import_fixes)}")
             subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
             _lint_strategy(source, strategy_file_path.name, bt_mode)
             _preflight_strategy_import(module_name, payload["python_bin"])
@@ -1448,6 +1469,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"], [s for s in (normalize_symbol(x) for x in parsed["symbols"]) if s])
             else:
                 source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"])
+            source, import_fixes = _autofix_imports(source, bt_mode)
+            if import_fixes: print(f"[autofix] import修正: {'; '.join(import_fixes)}")
             strategy_file_path.write_text(source, encoding="utf-8")
             subprocess.run([payload["python_bin"], "-m", "py_compile", str(strategy_file_path)], check=True, cwd=str(PROJECT_ROOT))
             _lint_strategy(source, strategy_file_path.name, bt_mode)
