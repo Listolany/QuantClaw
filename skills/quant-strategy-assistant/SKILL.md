@@ -153,8 +153,14 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
      - `cta` → 继承 `CtaTemplate`，`on_bar(self, bar)`，`self.buy(price, vol)` / `self.sell(price, vol)`，`self.pos`，初始化用 `self.load_bar(N)`（**单数**，N=bar 数量）
      - `portfolio` → 继承 `StrategyTemplate`（vnpy_portfoliostrategy），`on_bars(self, bars: dict)`，`self.buy(vt_symbol, price, vol)` / `self.sell(vt_symbol, price, vol)`，`self.get_pos(vt_symbol)`，初始化用 `self.load_bars(days)`（**复数**，days=天数）
    - **严禁混用**：CTA 策略禁止用 `load_bars`，Portfolio 策略禁止用 `load_bar`
-   - **仓位计算（强制）**：默认资金100万，用户未指定手数时必须按资金全仓动态计算买卖数量，禁止 `fixed_size=1` 这种玩具逻辑
-   - **交易所合规（强制）**：沪深主板/创业板 100 股整数倍，科创板(688xxx) 200 股起步+1 股递增（205 股合法）；策略内需含 `_calc_volume(symbol, price, capital)` 辅助函数
+   - **仓位计算（强制）**：使用 `self.available_cash`（引擎自动注入的可用现金）计算买入量，禁止使用固定 capital。引擎自动管理资金扣减/回款
+   - **账户属性（引擎自动注入，策略直接用）**：
+     - `self.available_cash` — 可用现金（买入扣减，卖出回款）
+     - `self.total_value` — 账户总值（现金+持仓市值）
+     - `self.closable_pos` — 可卖数量（T+1 自动扣减当日买入）
+     - `self.capital` — 等于 available_cash（兼容）
+   - **资金不足兜底**：引擎会自动调减买入量到可用现金能买的最大手数，无需策略手动检查
+   - **交易所合规（强制）**：沪深主板/创业板 100 股整数倍，科创板(688xxx) 200 股起步+1 股递增（205 股合法）
    - **ArrayManager API**：均线用 `am.sma()`，禁止用 `am.ma()`（vnpy 不存在此方法）
    - 写入 `${QUANTCLAW_ROOT}/strategies/{module_name}.py`
 
