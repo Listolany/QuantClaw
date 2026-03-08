@@ -459,6 +459,15 @@ quant-claw-push/
 
 ---
 
+### #18 — backtest_runner 因 interval 大小写不匹配直接退出 (run 20260308_160303)
+**日期**：2026-03-08  
+**现象**：回测 runtime_error `exit code=2`，实际是 argparse 拒绝 `--interval daily`（小写），`backtest_runner.py` choices 只认大写 `DAILY`  
+**根因链**：LLM agent 传 `--interval daily`（小写）→ `submit` argparse 无 choices 校验 → payload 原样保留小写 → `backtest_runner.py` argparse `choices` 严格大小写 → 拒绝  
+**为什么静态检查没拦住**：`py_compile` 检查语法不管 CLI 参数；`_validate_engine_compat()` 内部 `.upper()` 归一化了所以没触发；缺少 payload 层的归一化  
+**修复**：`pipeline_orchestrator.py` L1280 payload 构建时 `.upper()` 归一化 interval
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |

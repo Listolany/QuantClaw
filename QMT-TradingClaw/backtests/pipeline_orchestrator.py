@@ -1277,7 +1277,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         "report_summary_url": report_summary_url,
         "start": args.start or parsed.get("start", ""),
         "end": args.end or parsed.get("end", ""),
-        "interval": args.interval or parsed["interval"],
+        "interval": (args.interval or parsed["interval"]).upper(),
         "capital": args.capital,
         "rate": args.rate,
         "slippage": args.slippage,
