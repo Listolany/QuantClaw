@@ -8,6 +8,7 @@ import io
 import ipaddress
 import json
 import os
+import signal
 import re
 import shutil
 import socket
@@ -1121,7 +1122,7 @@ window._tp=function(n){{pg=n;render()}};render()
 let h='';for(const[k,v] of Object.entries(M))h+='<div class="info-item"><div class="ik">'+k+'</div><div class="iv">'+v+'</div></div>';
 document.getElementById('infoGrid').innerHTML=h||'<div style="color:#94a3b8">无额外信息</div>'}})();
 hljs.highlightAll();
-function _cpCode(){{const c=document.querySelector('#p-code code');const t=c?c.textContent:'';const b=document.getElementById('cpBtn');navigator.clipboard.writeText(t).then(()=>{{b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{{b.classList.remove('copied');b.textContent='📋 复制代码'}},1500)}}).catch(()=>{{const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{{b.classList.remove('copied');b.textContent='📋 复制代码'}},1500)}})}}
+function _cpCode(){{const c=document.querySelector('#p-code code');const t=c?c.textContent:'';const b=document.getElementById('cpBtn');function _ok(){{b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{{b.classList.remove('copied');b.textContent='📋 复制代码'}},1500)}}function _fb(){{const ta=document.createElement('textarea');ta.value=t;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);_ok()}}if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(_ok).catch(_fb)}}else{{_fb()}}}}
 function _svCode(){{const c=document.querySelector('#p-code code');const t=c?c.textContent:'';const fn=(M.run_id||'strategy')+'_strategy.py';const bl=new Blob([t],{{type:'text/x-python'}});const a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download=fn;a.click();URL.revokeObjectURL(a.href)}}
 </script></body></html>'''
 
@@ -1999,6 +2000,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config-doctor", help="一键诊断所有必需配置项")
     sub.add_parser("qmt-check", help="检测 QMT 模拟/实盘环境可用性")
 
+    trade_cmd = sub.add_parser("trade", help="启动实盘/模拟交易（需 Windows + QMT）")
+    trade_cmd.add_argument("--run-id", default="", help="回测 run_id（从中提取策略信息）")
+    trade_cmd.add_argument("--strategy-file", default="", help="策略文件（与 run-id 二选一）")
+    trade_cmd.add_argument("--strategy-class", default="")
+    trade_cmd.add_argument("--symbols", default="")
+    trade_cmd.add_argument("--mode", default="cta", choices=["cta", "portfolio"])
+    trade_cmd.add_argument("--interval", default="", help="留空则从 run_id 解析，兜底 DAILY")
+    trade_cmd.add_argument("--capital", type=float, default=1000000)
+    trade_cmd.add_argument("--mock", action="store_true", help="Linux mock 模式")
+    trade_cmd.add_argument("--token", default="")
+
+    trade_stop_cmd = sub.add_parser("trade-stop", help="停止交易")
+    trade_stop_cmd.add_argument("--run-id", required=True)
+
     opt = sub.add_parser("optimize", help="参数优化（穷举/遗传算法）")
     opt.add_argument("--strategy-file", required=True, help="策略文件路径")
     opt.add_argument("--strategy-class", required=True, help="策略类名")
@@ -2242,6 +2257,74 @@ def cmd_qmt_check(_args: argparse.Namespace) -> int:
     return 0 if result["ready"] else 1
 
 
+def cmd_trade(args: argparse.Namespace) -> int:
+    """启动实盘/模拟交易"""
+    import platform as _plat, subprocess as _sp
+    strategy_file = args.strategy_file; strategy_class = args.strategy_class; symbols = args.symbols; mode = args.mode; interval = args.interval
+    if args.run_id: #从回测结果提取策略信息
+        store = RunStore(args.run_id)
+        if not store.state_file.exists():
+            print(json.dumps({"status": "error", "error": f"run_id {args.run_id} 不存在"}, ensure_ascii=False)); return 1
+        state = store.load()
+        if state.get("status") != "completed":
+            print(json.dumps({"status": "error", "error": f"run_id {args.run_id} 状态为 {state.get('status')}，需要 completed"}, ensure_ascii=False)); return 1
+        sf = state.get("artifacts", {}).get("strategy_file", "")
+        if sf and Path(sf).exists(): strategy_file = sf
+        parsed = state.get("payload", {}).get("parsed", {})
+        if not strategy_class: strategy_class = parsed.get("class_name", "")
+        if not symbols: symbols = parsed.get("symbols", "")
+        if isinstance(symbols, list): symbols = ",".join(symbols)
+        if not mode: mode = parsed.get("mode", "cta")
+        if not interval: interval = parsed.get("interval", "")
+    if not interval: interval = "DAILY" #最终兜底
+    if not strategy_file or not strategy_class or not symbols:
+        print(json.dumps({"status": "error", "error": "缺少 --strategy-file/--strategy-class/--symbols（或通过 --run-id 提供）"}, ensure_ascii=False)); return 1
+    if not Path(strategy_file).exists():
+        print(json.dumps({"status": "error", "error": f"策略文件不存在: {strategy_file}"}, ensure_ascii=False)); return 1
+    is_mock = args.mock or _plat.system() != "Windows"
+    if _plat.system() != "Windows" and not args.mock:
+        print(json.dumps({"status": "platform_redirect", "hint": "模拟/实盘交易需在 Windows + QMT 环境运行", "mock_available": True,
+            "command": f'python "{BACKTESTS_DIR / "pipeline_orchestrator.py"}" trade --run-id {args.run_id or ""} --strategy-file "{strategy_file}" --strategy-class {strategy_class} --symbols "{symbols}"'}, ensure_ascii=False))
+        return 0
+    trade_dir = RUNS_DIR / f"trade_{args.run_id or datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    trade_dir.mkdir(parents=True, exist_ok=True)
+    token = args.token or resolve_qgdata_token("")[0]
+    cmd = [sys.executable, str(BACKTESTS_DIR / "trade_runner.py"),
+        "--strategy-file", str(Path(strategy_file).resolve()), "--strategy-class", strategy_class,
+        "--symbols", symbols, "--mode", mode, "--interval", interval,
+        "--capital", str(args.capital), "--state-dir", str(trade_dir),
+        "--datafeed-token", token]
+    if is_mock: cmd.append("--mock")
+    log_file = trade_dir / "trade.log"
+    p_log = open(log_file, "w", encoding="utf-8")
+    proc = _sp.Popen(cmd, stdout=p_log, stderr=_sp.STDOUT, cwd=str(BACKTESTS_DIR))
+    p_log.close() #Popen 已 dup fd，父进程立即释放
+    print(json.dumps({"status": "trading_started", "pid": proc.pid, "trade_dir": str(trade_dir),
+        "log_file": str(log_file), "mock": is_mock, "strategy_class": strategy_class, "symbols": symbols}, ensure_ascii=False))
+    return 0
+
+
+def cmd_trade_stop(args: argparse.Namespace) -> int:
+    """停止交易：写 _stop_flag 文件（跨平台）+ SIGTERM（Linux）"""
+    import platform as _plat
+    trade_dir = RUNS_DIR / f"trade_{args.run_id}"
+    sf = trade_dir / "trade_state.json"
+    if not sf.exists():
+        print(json.dumps({"status": "error", "error": f"交易状态文件不存在: {sf}"}, ensure_ascii=False)); return 1
+    state = read_json(sf)
+    pid = state.get("pid")
+    if not pid:
+        print(json.dumps({"status": "error", "error": "未找到交易进程 PID"}, ensure_ascii=False)); return 1
+    stop_flag = trade_dir / "_stop_flag"
+    stop_flag.write_text("stop", encoding="utf-8") #跨平台通用
+    if _plat.system() != "Windows": #Linux/Mac 额外发 SIGTERM 加速
+        try: os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+        except Exception: pass
+    print(json.dumps({"status": "stop_requested", "pid": pid, "method": "file_signal" if _plat.system() == "Windows" else "file_signal+SIGTERM"}, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.cmd == "submit":
@@ -2256,6 +2339,10 @@ def main() -> int:
         return cmd_config_doctor(args)
     if args.cmd == "qmt-check":
         return cmd_qmt_check(args)
+    if args.cmd == "trade":
+        return cmd_trade(args)
+    if args.cmd == "trade-stop":
+        return cmd_trade_stop(args)
     if args.cmd == "optimize":
         return cmd_optimize(args)
     return 1

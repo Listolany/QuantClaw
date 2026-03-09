@@ -22,7 +22,7 @@ metadata:
 | **CTA回测** | vnpy_ctastrategy | python3 + qgdata | 单标的择时策略，任意平台 |
 | **Portfolio回测** | vnpy_portfoliostrategy | python3 + qgdata | 多标的组合/轮动策略，任意平台 |
 | **参数优化** | vnpy OptimizationSetting | 同回测 | 回测后由用户触发，穷举/遗传算法 |
-| **模拟/实盘** | miniQMT | QMT 交易端 | 运行 `qmt-check` 检测可用性，缺失时如实提示具体缺少项 |
+| **模拟/实盘** | miniQMT + vnpy CTA引擎 | QMT 交易端 | `qmt-check` 检测 → `trade` 启动自动交易，含探针单验证 |
 
 回测是核心能力，不依赖 QMT。用户请求模拟/实盘时才运行 `qmt-check`。
 
@@ -50,20 +50,43 @@ metadata:
 
 **回测日期约束（强制）**：用户的回测日期意图必须由你转换为标准 `--start YYYYMMDD --end YYYYMMDD` 参数。例如用户说"最近1年"则根据当天日期计算 today-365 输出对应日期。用户未提及任何日期时，**不传** `--start/--end`（引擎默认最近1年，即 today-365 ~ today）。第1轮确认摘要中日期栏必须写"引擎默认最近1年"而非自行编造"近2年"等。**禁止**编造与用户意图不符的固定日期。
 
-### 模拟/实盘检测（独立流程，不走三轮协议）
+### 模拟/实盘交易（独立流程，不走三轮协议）
 
-用户提及 `模拟`/`实盘`/`QMT` 时触发：
+用户提及 `模拟`/`实盘`/`模拟交易`/`开始交易`/`QMT` 时触发。**前提：至少有一次成功的回测（status=completed）。**
+
+**第 1 步：环境检测**
 
 ```bash
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" qmt-check
 ```
 
 输出 JSON 含 `ready`（布尔）和 `hint`（缺失项说明）：
+- `ready=false` → 将 `hint` 中的缺失项如实告知用户
+- `ready=true` → 进入第 2 步
 
-- `ready=true` → 告知用户 QMT 环境已就绪。自动化模拟/实盘编排尚在开发中，当前可先完成回测验证策略
-- `ready=false` → 将 `hint` 中的缺失项如实告知用户（不主动提及操作系统）
+**第 2 步：启动交易**
 
-**禁止**在 `ready=true` 时编造不存在的模拟/实盘启动命令。
+```bash
+"${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" trade \
+  --run-id "{最近成功回测的 run_id}"
+```
+
+返回 JSON 分流：
+- `status=trading_started` → 告知用户：✅ 交易已启动（探针单验证 QMT 通信→策略运行中），附带日志路径
+- `status=platform_redirect` → 告知用户：需在 Windows + QMT 环境运行，给出命令
+- `status=error` → 告知具体错误
+
+**第 3 步：停止交易**（用户说「停止交易」时）
+
+```bash
+"${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" trade-stop --run-id "{run_id}"
+```
+
+**交易启动流程说明**（用户可见）：
+1. 加载策略 + 连接 QMT 交易端
+2. 加载历史数据预热（ArrayManager 初始化）
+3. 发送探针单（100股跌停附近买入 → 确认委托出现 → 自动撤单），验证下单链路
+4. 启动策略，开始接收实时行情并自动交易
 
 所需环境变量（仅模拟/实盘时需要，回测无关）：
 
@@ -121,7 +144,7 @@ DEFAULT_PRICETICK = 0.01
   - **回测第1轮**：`回测`、`策略`、`自动编排`、`均线`、`上穿`、`下穿`、`买入`、`卖出` → 进入三轮交互协议
   - **回测第2轮**：`开始生成`、`生成策略`、`好`、`开始`、`继续`、`1`（或任何第1轮确认后的用户消息）；若同条消息同时包含完整需求+第2轮触发词，直接视为已确认并进入第2轮
   - **参数优化**：`优化`、`调参`、`参数优化`、`网格搜索` → 执行 `optimize`（回测完成后触发）
-  - **模拟/实盘**：`模拟`、`模拟盘`、`实盘`、`实盘交易`、`QMT` → 执行 `qmt-check`（独立流程，不走三轮协议）
+  - **模拟/实盘**：`模拟`、`模拟盘`、`模拟交易`、`开始交易`、`实盘`、`实盘交易`、`QMT` → 执行 `qmt-check` + `trade`（独立流程，不走三轮协议）
 
 ---
 
@@ -310,7 +333,7 @@ for base in [Path('/opt'), Path.home(), Path('C:/'), Path('D:/')]:
 ```
 回测已完成，{摘要}。您可以：
 1. 回复「优化参数」对策略参数进行网格搜索
-2. 回复「模拟/实盘」检测 QMT 环境
+2. 回复「模拟交易」在 QMT 中启动自动交易（需 Windows + QMT 环境）
 ```
 
 ---
