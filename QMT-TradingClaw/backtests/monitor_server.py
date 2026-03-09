@@ -98,6 +98,11 @@ body{font-family:system-ui,-apple-system,sans-serif;background:linear-gradient(1
 .code-wrap{background:#fafafa;border-radius:12px;border:1px solid #e2e8f0;overflow:hidden}
 .code-h{padding:12px 16px;background:#f1f5f9;border-bottom:1px solid #e2e8f0;font-size:12px;color:#64748b;display:flex;align-items:center;gap:8px}
 .code-h svg{width:16px;height:16px}
+.code-h .spacer{flex:1}
+.code-btn{padding:4px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;font-size:12px;color:#475569;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:4px}
+.code-btn:hover{background:#f1f5f9;border-color:#94a3b8;color:#1e293b}
+.code-btn:active{transform:scale(.96)}
+.code-btn.copied{background:#dcfce7;border-color:#86efac;color:#16a34a}
 pre.code-block{background:#fafafa;margin:0;padding:16px;font-size:13px;max-height:420px;overflow:auto;line-height:1.7}
 pre.code-block code{font-family:'Cascadia Code','Fira Code','Consolas',monospace}
 .progress-outer{height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden}
@@ -282,9 +287,13 @@ es.addEventListener('requirement',e=>{const d=JSON.parse(e.data);setBadge('b1','
   const isP=d.mode==='portfolio';const skip=isP?new Set(['fast_window','slow_window','direction','pool_warning','data_blocked','start','end']):new Set(['pool_warning','data_blocked','start','end']);
   let h='<div class="req-grid">';for(const[k,v] of Object.entries(d)){if(skip.has(k)||!v)continue;const lbl=km[k]||k;const val=Array.isArray(v)?v.join(', '):(vm[v]||v);h+='<div class="req-item"><div class="k">'+lbl+'</div><div class="v">'+val+'</div></div>'}
   el.innerHTML=h+'</div>'});
+let _codeContent='',_codeFilename='strategy.py';
+function _copyCode(){const b=document.getElementById('copyBtn');navigator.clipboard.writeText(_codeContent).then(()=>{b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{b.classList.remove('copied');b.textContent='📋 复制代码'},1500)}).catch(()=>{const ta=document.createElement('textarea');ta.value=_codeContent;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{b.classList.remove('copied');b.textContent='📋 复制代码'},1500)})}
+function _saveCode(){const blob=new Blob([_codeContent],{type:'text/x-python'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=_codeFilename;a.click();URL.revokeObjectURL(a.href)}
 es.addEventListener('code',e=>{const d=JSON.parse(e.data);setBadge('b2','success');
+  _codeContent=d.content||'';_codeFilename=d.filename||'strategy.py';
   const el=document.getElementById('c2');el.classList.remove('empty');
-  el.innerHTML='<div class="code-wrap"><div class="code-h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>📄 '+(d.filename||'strategy.py')+' · 已保存至绝对路径</div><pre class="code-block"><code class="language-python">'+esc(d.content)+'</code></pre></div>';
+  el.innerHTML='<div class="code-wrap"><div class="code-h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>📄 '+(d.filename||'strategy.py')+' · 已保存至绝对路径<span class="spacer"></span><button class="code-btn" id="copyBtn" onclick="_copyCode()">📋 复制代码</button><button class="code-btn" onclick="_saveCode()">💾 保存策略</button></div><pre class="code-block"><code class="language-python">'+esc(d.content)+'</code></pre></div>';
   try{hljs.highlightAll()}catch(e){}});
 es.addEventListener('progress',e=>{const d=JSON.parse(e.data);
   if(d.run_id)document.getElementById('rid').textContent='run: '+d.run_id;
@@ -429,6 +438,7 @@ function _pollState(){
       g.className='pill pill-f';g.textContent='失败';
     }
     if(!_sseOk){_renderPollLogs(d.logs);_renderPollStats(d.stats)}
+    if(d.has_code&&!_codeContent){fetch('/api/code').then(r=>r.json()).then(cd=>{if(cd&&cd.content){_codeContent=cd.content;_codeFilename=cd.filename||'strategy.py';setBadge('b2','success');const el=document.getElementById('c2');el.classList.remove('empty');el.innerHTML='<div class="code-wrap"><div class="code-h"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>📄 '+esc(cd.filename||'strategy.py')+' · 已保存至绝对路径<span class="spacer"></span><button class="code-btn" id="copyBtn" onclick="_copyCode()">📋 复制代码</button><button class="code-btn" onclick="_saveCode()">💾 保存策略</button></div><pre class="code-block"><code class="language-python">'+esc(cd.content)+'</code></pre></div>';try{hljs.highlightAll()}catch(e){}}}).catch(()=>{})}
     if(d.result_warnings)_renderWarnings(d.result_warnings);
     if(chart&&!_chartOk&&(d.point_count||0)>0)_ensureChart();
     if(chart&&(d.point_count||0)>chartOpt.series[0].data.length){fetch('/api/chart').then(r=>r.json()).then(ch=>{
@@ -553,6 +563,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif STATE.get("points"): chart_data = {"dates": [p["dt"] for p in STATE["points"]], "navs": [p["nav"] for p in STATE["points"]], "bench": []} #回测中：返回实时累积点
                 else: chart_data = {}
             self.wfile.write(json.dumps(chart_data, ensure_ascii=False).encode())
+        elif path == "/api/code":
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+            with LOCK: self.wfile.write(json.dumps({"filename": STATE.get("code_file",""), "content": STATE.get("code","")}, ensure_ascii=False).encode())
         elif path == "/api/health":
             self._json_ok()
         else:
