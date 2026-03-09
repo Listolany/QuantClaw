@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """实盘/模拟交易执行器 - headless vnpy CTA引擎 + XtGateway + BarGenerator注入 + 账户模型"""
-import sys, os, time, json, signal, argparse, importlib.util, platform, threading
+import sys, os, time, json, signal, argparse, importlib.util, platform, threading, string
 from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
 
@@ -17,7 +17,7 @@ from vnpy.trader.event import EVENT_ACCOUNT, EVENT_POSITION, EVENT_ORDER, EVENT_
 from vnpy.trader.utility import BarGenerator
 from vnpy.trader.setting import SETTINGS
 
-TRADE_STATE_FILE = "trade_state.json" #每个run_id目录下
+TRADE_STATE_FILE = "trade_state.json"
 RATE = 0.0003
 _running = True
 _log_lines = []
@@ -36,6 +36,35 @@ def _sig_handler(sig, _frame):
 signal.signal(signal.SIGINT, _sig_handler)
 signal.signal(signal.SIGTERM, _sig_handler)
 
+# ═══════════════ QMT 路径自动发现 ═══════════════
+def auto_discover_qmt_path() -> str:
+    """返回 QMT 安装目录（含 userdata_mini 的父目录），优先级：环境变量→进程反推→目录扫描"""
+    env = os.environ.get("QMT_PATH", "")
+    if env and (Path(env) / "userdata_mini").is_dir(): return env
+    if platform.system() != "Windows": return ""
+    try: #从运行中的 miniQMT 进程可执行路径反推安装目录
+        import subprocess as _sp
+        out = _sp.check_output('wmic process where "name like \'%XtMiniQmt%\' or name like \'%miniQMT%\'" get ExecutablePath /value', text=True, timeout=5, stderr=_sp.DEVNULL)
+        for line in out.splitlines():
+            if "=" in line:
+                exe = line.split("=", 1)[1].strip()
+                if exe:
+                    candidate = Path(exe).parent
+                    if (candidate / "userdata_mini").is_dir(): return str(candidate)
+                    if (candidate.parent / "userdata_mini").is_dir(): return str(candidate.parent)
+    except Exception: pass
+    for drive in string.ascii_uppercase: #兜底：目录扫描
+        root = Path(f"{drive}:\\")
+        if not root.exists(): continue
+        for parent in [root, root / "Program Files", root / "Program Files (x86)"]:
+            if not parent.exists(): continue
+            try:
+                for item in parent.iterdir():
+                    if item.is_dir() and ("qmt" in item.name.lower() or "迅投" in item.name):
+                        if (item / "userdata_mini").is_dir(): return str(item)
+            except PermissionError: continue
+    return ""
+
 # ═══════════════ 策略类动态加载 ═══════════════
 def load_strategy_class(strategy_file: str, class_name: str):
     spec = importlib.util.spec_from_file_location("_dyn_strategy", strategy_file)
@@ -50,28 +79,26 @@ def load_strategy_class(strategy_file: str, class_name: str):
 def inject_bar_generator(strategy, interval: Interval):
     """注入 tick→1min→目标周期 的 BarGenerator 链，使日线策略在 live 模式下正确运行"""
     if interval not in (Interval.DAILY, Interval.WEEKLY):
-        _bg_tick = BarGenerator(strategy.on_bar) #分钟策略：tick→1min bar→on_bar
+        _bg_tick = BarGenerator(strategy.on_bar)
         strategy.on_tick = lambda tick: _bg_tick.update_tick(tick)
         p(f"[inject] 分钟策略 BarGenerator 已注入 (tick→1min→on_bar)")
         return
-    _real_on_bar = strategy.on_bar #保存策略真实交易逻辑
+    _real_on_bar = strategy.on_bar
     _bg_daily = BarGenerator(on_bar=lambda b: None, window=0, on_window_bar=_real_on_bar, interval=Interval.DAILY, daily_end=dtime(15, 0))
-    _bg_tick = BarGenerator(on_bar=_bg_daily.update_bar) #tick→1min→日线聚合器
+    _bg_tick = BarGenerator(on_bar=_bg_daily.update_bar)
     strategy.on_tick = lambda tick: _bg_tick.update_tick(tick)
     p(f"[inject] 日线策略 BarGenerator 已注入 (tick→1min→daily@15:00→on_bar)")
 
 def patch_load_bar(strategy, cta_engine, vt_symbol, interval: Interval):
     """patch load_bar：强制加载日线历史，直喂策略 on_bar 初始化 ArrayManager"""
     _real_on_bar = strategy.on_bar
-    _orig_load_bar = strategy.load_bar
     def _patched(days=10, interval_arg=None, callback=None, use_database=False):
         target_interval = Interval.DAILY if interval in (Interval.DAILY, Interval.WEEKLY) else Interval.MINUTE
         cb = callback or _real_on_bar
         p(f"[load_bar] 加载 {days} 天 {target_interval.value} 历史数据...")
         bars = cta_engine.load_bar(vt_symbol, days, target_interval, cb, use_database)
         p(f"[load_bar] 获取 {len(bars)} 根 bar，逐根回放...")
-        for bar in bars:
-            cb(bar)
+        for bar in bars: cb(bar)
         p(f"[load_bar] 回放完成，ArrayManager 应已初始化")
     strategy.load_bar = _patched
 
@@ -105,7 +132,7 @@ def patch_live_account(cta_engine, strategy, capital: float, rate: float, mode: 
         def _send_wrap(strat, direction, offset, price, volume, stop, lock, net):
             sym = getattr(strat, "vt_symbol", ""); vol = _lot_floor(sym, int(volume)); price_f = float(price)
             if vol <= 0: p(f"[账户] {sym} 下单{int(volume)}股不满足最小手数"); return []
-            acct["last_price"] = price_f #用下单价更新（下单时一定有价格）
+            acct["last_price"] = price_f
             if direction == Direction.LONG:
                 cost = price_f * vol * (1 + rate)
                 if cost > acct["cash"] + 0.01:
@@ -139,7 +166,7 @@ def patch_live_account(cta_engine, strategy, capital: float, rate: float, mode: 
                 if result: acct["cash"] += price_f * vol * (1 - rate); acct["stats"]["orders"] += 1; _inject()
                 return result
         cta_engine.send_order = _send_wrap_p
-    def _on_tick(event): #tick 事件更新最新价
+    def _on_tick(event):
         tick: TickData = event.data
         if tick.last_price > 0:
             if mode == "cta":
@@ -156,9 +183,9 @@ def patch_live_account(cta_engine, strategy, capital: float, rate: float, mode: 
     def _on_trade(event):
         trade: TradeData = event.data
         acct["stats"]["fills"] += 1
-        if mode == "cta": acct["last_price"] = trade.price #成交价更精确
+        if mode == "cta": acct["last_price"] = trade.price
         else: acct["last_prices"][trade.vt_symbol] = trade.price
-        _inject() #成交后立刻刷新账户属性
+        _inject()
         p(f"[成交] {trade.vt_symbol} {trade.direction.value} {trade.volume}@{trade.price}")
     return acct, _on_tick, _on_account, _on_trade
 
@@ -177,12 +204,15 @@ def probe_order(main_engine, gateway_name: str, vt_symbol: str, mock: bool = Fal
         return True
     from vnpy.trader.object import OrderRequest, CancelRequest
     from vnpy.trader.constant import OrderType
-    from vnpy_xt.xt_gateway import symbol_limit_map
-    limits = symbol_limit_map.get(vt_symbol) #(涨停价, 跌停价)
+    try:
+        from vnpy_xt.xt_gateway import symbol_limit_map
+        limits = symbol_limit_map.get(vt_symbol)
+    except ImportError:
+        limits = None
     if limits and limits[1] > 0:
-        probe_price = round(limits[1] - contract.pricetick, 2) #略低于跌停价→合法但不成交
+        probe_price = round(limits[1] - contract.pricetick, 2) #略低于跌停价
     else:
-        probe_price = round(contract.pricetick * 100, 2) or 0.01 #兜底
+        probe_price = round(contract.pricetick * 100, 2) or 0.01
     req = OrderRequest(symbol=symbol, exchange=exchange, direction=Direction.LONG, type=OrderType.LIMIT, price=probe_price, volume=100, offset=Offset.NONE)
     p(f"[探针] 发送探针单: {vt_symbol} 买入100股@{probe_price}")
     vt_orderid = main_engine.send_order(req, gateway_name)
@@ -229,8 +259,8 @@ class MockGateway:
 def main():
     global _running
     ap = argparse.ArgumentParser(description="QuantClaw 实盘/模拟交易执行器")
-    ap.add_argument("--strategy-file", required=True)
-    ap.add_argument("--strategy-class", required=True)
+    ap.add_argument("--strategy-file", default="", help="策略文件（--probe-only 时可省略）")
+    ap.add_argument("--strategy-class", default="")
     ap.add_argument("--symbols", required=True, help="逗号分隔 vt_symbol")
     ap.add_argument("--mode", default="cta", choices=["cta", "portfolio"])
     ap.add_argument("--interval", default="DAILY")
@@ -238,28 +268,28 @@ def main():
     ap.add_argument("--rate", type=float, default=RATE)
     ap.add_argument("--state-dir", default="")
     ap.add_argument("--mock", action="store_true", help="Linux mock模式，不连真实QMT")
-    ap.add_argument("--datafeed-name", default="xt", help="datafeed: xt(默认,QgDatafeed) 或留空")
+    ap.add_argument("--datafeed-name", default="xt", help="datafeed: xt(默认,QgDatafeed)")
     ap.add_argument("--datafeed-token", default="")
+    ap.add_argument("--qmt-path", default="", help="QMT安装目录（留空自动发现）")
+    ap.add_argument("--account-id", default="", help="资金账号（留空读 QMT_ACCOUNT_ID 环境变量）")
+    ap.add_argument("--probe-only", action="store_true", help="仅执行探针单验证后退出")
     args = ap.parse_args()
 
     vt_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     interval = Interval(args.interval) if args.interval in [i.value for i in Interval] else Interval.DAILY
     state_dir = Path(args.state_dir) if args.state_dir else Path(".")
     state_dir.mkdir(parents=True, exist_ok=True)
+    is_probe = args.probe_only
+    total_steps = 2 if is_probe else 7
 
-    p(f"========== QuantClaw Trade Runner ==========")
-    p(f"策略: {args.strategy_file} :: {args.strategy_class}")
+    p(f"========== QuantClaw Trade Runner {'(探针模式)' if is_probe else ''} ==========")
+    if not is_probe: p(f"策略: {args.strategy_file} :: {args.strategy_class}")
     p(f"标的: {vt_symbols}  模式: {args.mode}  周期: {interval.value}")
     p(f"资金: {args.capital}  费率: {args.rate}  mock: {args.mock}")
     write_state(state_dir, "initializing")
 
-    # ① 加载策略类
-    p("[1/7] 加载策略类...")
-    strategy_cls = load_strategy_class(args.strategy_file, args.strategy_class)
-    p(f"  ✓ 策略类 {args.strategy_class} 加载成功")
-
-    # ② 创建 headless vnpy 引擎
-    p("[2/7] 创建 headless vnpy 引擎...")
+    # ═══ ① 创建引擎 + 连接 QMT（最先执行，失败则后续全部无意义） ═══
+    p(f"[1/{total_steps}] 创建引擎 + 连接 QMT...")
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
 
@@ -272,31 +302,53 @@ def main():
             p("  ⚠️ 非 Windows 系统，XtGateway 可能不可用，建议使用 --mock")
         from vnpy_xt import XtGateway
         main_engine.add_gateway(XtGateway)
-        qmt_path = os.environ.get("QMT_PATH", "")
-        account_id = os.environ.get("QMT_ACCOUNT_ID", "")
-        if not qmt_path or not account_id:
-            p("  ✗ 缺少 QMT_PATH 或 QMT_ACCOUNT_ID 环境变量")
-            write_state(state_dir, "error", {"error": "缺少QMT环境变量"})
+        qmt_path = args.qmt_path or auto_discover_qmt_path()
+        account_id = args.account_id or os.environ.get("QMT_ACCOUNT_ID", "")
+        if not qmt_path:
+            p("  ✗ 未找到 QMT 安装路径（--qmt-path / QMT_PATH / 自动扫描均未命中）")
+            write_state(state_dir, "error", {"error": "未找到QMT路径"})
+            return 1
+        if not account_id:
+            p("  ✗ 缺少资金账号（--account-id / QMT_ACCOUNT_ID）")
+            write_state(state_dir, "error", {"error": "缺少资金账号"})
             return 1
         setting = {"token": "", "股票市场": "是", "期货市场": "否", "期权市场": "否", "仿真交易": "是", "账号类型": "股票", "QMT路径": qmt_path, "资金账号": account_id}
         p(f"  连接 XtGateway (QMT={qmt_path}, 账号=***{account_id[-4:]})...")
         main_engine.connect(setting, gateway_name)
-        p("  等待网关连接...")
-        time.sleep(8) #等待合约加载+行情连接
+        p("  等待网关连接 + 合约加载...")
+        time.sleep(8)
+    p(f"  ✓ 引擎就绪 (gateway={gateway_name})")
 
-    # ③ 配置 datafeed（load_bar 需要）
-    p("[3/7] 配置 datafeed...")
+    # ═══ ② 探针单验证 QMT 通信（在加载策略之前，fail fast） ═══
+    p(f"[2/{total_steps}] 探针单验证 QMT 通信...")
+    write_state(state_dir, "probing")
+    probe_ok = probe_order(main_engine, gateway_name, vt_symbols[0], mock=args.mock)
+    if not probe_ok:
+        p("  ⚠️ 探针单失败（可能非交易时段），继续...")
+
+    if is_probe: #探针模式：验证完即退出
+        p("探针验证完成，退出")
+        try: main_engine.close()
+        except: pass
+        write_state(state_dir, "probe_done", {"probe_ok": probe_ok})
+        return 0 if probe_ok else 1
+
+    # ═══ ③ 加载策略类 ═══
+    if not args.strategy_file or not args.strategy_class:
+        p("  ✗ 缺少 --strategy-file / --strategy-class")
+        write_state(state_dir, "error", {"error": "缺少策略文件/类名"})
+        main_engine.close(); return 1
+    p(f"[3/{total_steps}] 加载策略类...")
+    strategy_cls = load_strategy_class(args.strategy_file, args.strategy_class)
+    p(f"  ✓ 策略类 {args.strategy_class} 加载成功")
+
+    # ═══ ④ 配置 datafeed + 注册策略 + 注入 ═══
+    p(f"[4/{total_steps}] 配置 datafeed + 注册策略 + 注入...")
     SETTINGS["datafeed.name"] = args.datafeed_name
-    if args.datafeed_token:
-        SETTINGS["datafeed.password"] = args.datafeed_token
-    p(f"  datafeed={args.datafeed_name}")
+    if args.datafeed_token: SETTINGS["datafeed.password"] = args.datafeed_token
 
-    # ④ 添加 CTA App + 注册策略 + 注入
-    p("[4/7] 注册策略 + BarGenerator/AccountBridge 注入...")
     from vnpy_ctastrategy import CtaStrategyApp
-    cta_app = main_engine.add_app(CtaStrategyApp)
-    cta_engine = cta_app #CtaEngine实例
-
+    cta_engine = main_engine.add_app(CtaStrategyApp)
     instance_name = "auto_trade"
     cta_engine.classes[args.strategy_class] = strategy_cls
     cta_engine.add_strategy(args.strategy_class, instance_name, vt_symbols[0], {})
@@ -304,22 +356,22 @@ def main():
     if not strategy:
         p("  ✗ 策略实例创建失败")
         write_state(state_dir, "error", {"error": "策略实例创建失败"})
-        return 1
+        main_engine.close(); return 1
 
-    inject_bar_generator(strategy, interval) #注入 BarGenerator
-    patch_load_bar(strategy, cta_engine, vt_symbols[0], interval) #patch load_bar
+    inject_bar_generator(strategy, interval)
+    patch_load_bar(strategy, cta_engine, vt_symbols[0], interval)
     acct, on_tick_cb, on_account_cb, on_trade_cb = patch_live_account(cta_engine, strategy, args.capital, args.rate, args.mode, vt_symbols)
     from vnpy.trader.event import EVENT_TICK
-    event_engine.register(EVENT_TICK, on_tick_cb) #tick更新最新价→持仓市值
-    event_engine.register(EVENT_ACCOUNT, on_account_cb) #网关资金校正
-    event_engine.register(EVENT_TRADE, on_trade_cb) #成交→现金预扣校正
-    p("  ✓ BarGenerator + AccountBridge 注入完成")
+    event_engine.register(EVENT_TICK, on_tick_cb)
+    event_engine.register(EVENT_ACCOUNT, on_account_cb)
+    event_engine.register(EVENT_TRADE, on_trade_cb)
+    p("  ✓ datafeed + BarGenerator + AccountBridge 注入完成")
 
-    # ⑤ 初始化策略（load_bar + ArrayManager 预热）
-    p("[5/7] 初始化策略 (load_bar 预热)...")
+    # ═══ ⑤ 初始化策略（load_bar + ArrayManager 预热） ═══
+    p(f"[5/{total_steps}] 初始化策略 (load_bar 预热)...")
     write_state(state_dir, "initializing_strategy")
     cta_engine.init_strategy(instance_name)
-    time.sleep(2) #等待异步init完成
+    time.sleep(2)
     if not strategy.inited:
         p("  等待 init 完成...")
         for _ in range(30):
@@ -328,34 +380,27 @@ def main():
     if not strategy.inited:
         p("  ✗ 策略初始化超时")
         write_state(state_dir, "error", {"error": "策略初始化超时"})
-        return 1
+        main_engine.close(); return 1
     p("  ✓ 策略初始化完成")
 
-    # ⑥ 探针单验证
-    p("[6/7] 探针单验证 QMT 通信...")
-    write_state(state_dir, "probing")
-    probe_ok = probe_order(main_engine, gateway_name, vt_symbols[0], mock=args.mock)
-    if not probe_ok:
-        p("  ⚠️ 探针单失败，但继续运行（可能非交易时段）")
-
-    # ⑦ 启动策略
-    p("[7/7] 启动策略交易...")
+    # ═══ ⑥ 启动策略 ═══
+    p(f"[6/{total_steps}] 启动策略交易...")
     cta_engine.start_strategy(instance_name)
     if not strategy.trading:
         p("  ✗ 策略启动失败")
         write_state(state_dir, "error", {"error": "策略启动失败"})
-        return 1
+        main_engine.close(); return 1
     p("  ✓ 策略已启动，开始接收行情和交易")
     p("=" * 50)
     p("交易运行中... Ctrl+C 或 SIGTERM 停止")
     write_state(state_dir, "trading", {"strategy": args.strategy_class, "symbols": vt_symbols})
 
-    # ⑧ 主循环保活（轮询 _stop_flag 文件兼容 Windows）
+    # ═══ ⑦ 主循环保活 ═══
     _stop_flag_file = state_dir / "_stop_flag"
     last_report = time.time()
     while _running:
         time.sleep(1)
-        if _stop_flag_file.exists(): #文件信号停止（Windows 兼容）
+        if _stop_flag_file.exists():
             p("[stop] 检测到 _stop_flag 文件，准备停止...")
             _running = False; break
         now = time.time()
@@ -364,7 +409,7 @@ def main():
             extra = {"strategy": args.strategy_class, "symbols": vt_symbols, "account": {"cash": round(acct["cash"], 2), "real_cash": acct.get("real_cash")}, "stats": acct["stats"]}
             write_state(state_dir, "trading", extra)
 
-    # ⑨ 优雅退出
+    # ═══ 优雅退出 ═══
     p("正在停止策略...")
     try: cta_engine.stop_strategy(instance_name)
     except Exception as e: p(f"  stop_strategy 异常: {e}")

@@ -54,15 +54,27 @@ metadata:
 
 用户提及 `模拟`/`实盘`/`模拟交易`/`开始交易`/`QMT` 时触发。**前提：至少有一次成功的回测（status=completed）。**
 
-**第 1 步：环境检测**
+**第 1 步：环境检测**（自动发现 QMT 路径，无需用户手动配置路径）
 
 ```bash
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" qmt-check
 ```
 
-输出 JSON 含 `ready`（布尔）和 `hint`（缺失项说明）：
-- `ready=false` → 将 `hint` 中的缺失项如实告知用户
+输出 JSON 含 `ready`（布尔）和 `hint`（状态说明）：
+- `platform != Windows` → 提示用户在 Windows + QMT 环境运行
+- QMT 路径自动扫描失败 → 提示确认 QMT 已安装
+- QMT 终端未运行 → 提示"请先打开 QMT 并以极简模式登录"
+- 缺少资金账号 → 提示通过 `--account-id` 或 `QMT_ACCOUNT_ID` 提供
 - `ready=true` → 进入第 2 步
+
+**第 1.5 步：探针验证**（可选，独立验证下单链路，不依赖策略）
+
+```bash
+"${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" probe \
+  --symbol "{标的代码,如600519.SSE}" --account-id "{资金账号}"
+```
+
+发送 100 股跌停附近买单 → QMT 委托列表可见 → 自动撤单。用户在 QMT 终端看到委托闪现即确认通信正常。此步骤可跳过，因为 `trade` 命令内部也会自动执行探针。
 
 **第 2 步：启动交易**
 
@@ -72,7 +84,7 @@ metadata:
 ```
 
 返回 JSON 分流：
-- `status=trading_started` → 告知用户：✅ 交易已启动（探针单验证 QMT 通信→策略运行中），附带日志路径
+- `status=trading_started` → 告知用户：✅ 交易已启动，附带日志路径
 - `status=platform_redirect` → 告知用户：需在 Windows + QMT 环境运行，给出命令
 - `status=error` → 告知具体错误
 
@@ -82,18 +94,19 @@ metadata:
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" trade-stop --run-id "{run_id}"
 ```
 
-**交易启动流程说明**（用户可见）：
-1. 加载策略 + 连接 QMT 交易端
-2. 加载历史数据预热（ArrayManager 初始化）
-3. 发送探针单（100股跌停附近买入 → 确认委托出现 → 自动撤单），验证下单链路
-4. 启动策略，开始接收实时行情并自动交易
+**交易启动内部流程**（trade_runner 执行顺序，用户可见摘要）：
+1. 连接 QMT 交易端（路径自动发现）
+2. 探针单验证下单链路（100 股跌停附近挂单→确认→撤单）
+3. 加载策略类 + 注入 BarGenerator（tick→日线聚合）
+4. 加载历史数据预热 ArrayManager
+5. 启动策略，接收实时行情并自动交易
 
-所需环境变量（仅模拟/实盘时需要，回测无关）：
+所需用户配置（仅模拟/实盘时，回测无关）：
 
-| 变量 | 说明 |
-|------|------|
-| `QMT_PATH` | QMT 安装目录（含 `userdata_mini` 子目录） |
-| `QMT_ACCOUNT_ID` | 资金账号 |
+| 项目 | 方式 | 说明 |
+|------|------|------|
+| QMT 路径 | **自动发现** | 扫描各盘符下含 `userdata_mini` 的 QMT 目录，也可通过 `QMT_PATH` 环境变量覆盖 |
+| 资金账号 | `--account-id` 或 `QMT_ACCOUNT_ID` | 券商资金账号（仅此一项需用户提供） |
 
 ## 环境
 

@@ -1998,7 +1998,13 @@ def build_parser() -> argparse.ArgumentParser:
     ls_cmd.add_argument("--limit", type=int, default=20)
 
     sub.add_parser("config-doctor", help="一键诊断所有必需配置项")
-    sub.add_parser("qmt-check", help="检测 QMT 模拟/实盘环境可用性")
+    qmt_chk = sub.add_parser("qmt-check", help="检测 QMT 环境（自动发现路径+连接测试）")
+    qmt_chk.add_argument("--account-id", default="", help="资金账号（可选，留空读环境变量）")
+
+    probe_cmd = sub.add_parser("probe", help="独立探针：连接 QMT + 下单/撤单验证")
+    probe_cmd.add_argument("--symbol", default="600519.SSE", help="探针标的（默认贵州茅台）")
+    probe_cmd.add_argument("--account-id", default="", help="资金账号")
+    probe_cmd.add_argument("--mock", action="store_true", help="Linux mock 模式")
 
     trade_cmd = sub.add_parser("trade", help="启动实盘/模拟交易（需 Windows + QMT）")
     trade_cmd.add_argument("--run-id", default="", help="回测 run_id（从中提取策略信息）")
@@ -2009,6 +2015,7 @@ def build_parser() -> argparse.ArgumentParser:
     trade_cmd.add_argument("--interval", default="", help="留空则从 run_id 解析，兜底 DAILY")
     trade_cmd.add_argument("--capital", type=float, default=1000000)
     trade_cmd.add_argument("--mock", action="store_true", help="Linux mock 模式")
+    trade_cmd.add_argument("--account-id", default="", help="资金账号（留空读 QMT_ACCOUNT_ID 环境变量）")
     trade_cmd.add_argument("--token", default="")
 
     trade_stop_cmd = sub.add_parser("trade-stop", help="停止交易")
@@ -2221,41 +2228,86 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_qmt_check(_args: argparse.Namespace) -> int:
-    """检测 QMT 模拟/实盘环境可用性，输出 JSON"""
-    result: Dict[str, Any] = {"xtquant": False, "qmt_path": "", "qmt_path_ok": False, "account_id": "", "ready": False, "hint": ""}
-    _orig_stdout = sys.stdout
-    sys.stdout = io.StringIO()  # xtquant 导入时会打印文档地址，抑制以保持 JSON 输出干净
-    try:
-        import xtquant  # type: ignore  # noqa: F401
-        result["xtquant"] = True
-    except ImportError:
-        pass
-    finally:
-        sys.stdout = _orig_stdout
-    qmt_path = os.getenv("QMT_PATH", "")
-    result["qmt_path"] = qmt_path
-    if qmt_path:
-        result["qmt_path_ok"] = (Path(qmt_path) / "userdata_mini").is_dir()
-    account_id = os.getenv("QMT_ACCOUNT_ID", "")
-    result["account_id"] = ("***" + account_id[-4:]) if len(account_id) > 4 else ("已配置" if account_id else "")
-    result["ready"] = result["xtquant"] and result["qmt_path_ok"] and bool(account_id)
-    if result["ready"]:
-        result["hint"] = "QMT 环境就绪，可进行模拟/实盘交易"
-    else:
-        missing = []
-        if not result["xtquant"]:
-            missing.append("xtquant 库（需安装 miniQMT SDK）")
-        if not qmt_path:
-            missing.append("QMT_PATH 环境变量（指向 QMT 安装目录）")
-        elif not result["qmt_path_ok"]:
-            missing.append(f"QMT_PATH={qmt_path} 下未找到 userdata_mini 目录，请确认 QMT 已安装且路径正确")
-        if not account_id:
-            missing.append("QMT_ACCOUNT_ID 环境变量")
-        result["hint"] = "缺少: " + "; ".join(missing)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["ready"] else 1
+def _auto_discover_qmt_path() -> str:
+    """自动发现 QMT 安装目录，复用 trade_runner 同一实现保持一致"""
+    from trade_runner import auto_discover_qmt_path
+    return auto_discover_qmt_path()
 
+def cmd_qmt_check(args: argparse.Namespace) -> int:
+    """检测 QMT 环境：自动发现路径 + 尝试连接验证 QMT 终端是否在线"""
+    import platform as _plat
+    result: Dict[str, Any] = {"platform": _plat.system(), "xtquant": False, "qmt_path": "", "qmt_path_ok": False,
+        "qmt_connected": False, "account_id": "", "ready": False, "hint": ""}
+    if _plat.system() != "Windows":
+        result["hint"] = "当前为非 Windows 环境，模拟/实盘需在 Windows + QMT 下运行"
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    _orig_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        import xtquant; result["xtquant"] = True  # type: ignore  # noqa: F401
+    except ImportError: pass
+    finally: sys.stdout = _orig_stdout
+    if not result["xtquant"]:
+        result["hint"] = "缺少 xtquant 库，需安装 miniQMT SDK"
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    qmt_path = _auto_discover_qmt_path()
+    result["qmt_path"] = qmt_path
+    result["qmt_path_ok"] = bool(qmt_path) and (Path(qmt_path) / "userdata_mini").is_dir()
+    if not result["qmt_path_ok"]:
+        result["hint"] = "未找到 QMT 安装路径（自动扫描和 QMT_PATH 环境变量均未命中），请确认 QMT 已安装"
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    try: #尝试连接验证 QMT 终端是否运行
+        from xtquant.xttrader import XtQuantTrader
+        _session = int(time.time() * 1000) % 999999
+        _trader = XtQuantTrader(str(Path(qmt_path) / "userdata_mini"), _session)
+        _trader.start()
+        if _trader.connect() == 0:
+            result["qmt_connected"] = True
+            try: _trader.stop(); del _trader
+            except: pass
+        else:
+            result["hint"] = "QMT 安装目录已找到，但终端未运行。请先打开 QMT 并以极简模式登录"
+            print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    except Exception as e:
+        result["hint"] = f"QMT 连接测试异常: {e}"
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    account_id = getattr(args, "account_id", "") or os.getenv("QMT_ACCOUNT_ID", "")
+    result["account_id"] = ("***" + account_id[-4:]) if len(account_id) > 4 else ("已配置" if account_id else "")
+    if not account_id:
+        result["hint"] = "QMT 已连接，但缺少资金账号。请通过 --account-id 或 QMT_ACCOUNT_ID 环境变量提供"
+        result["qmt_connected"] = True #连接OK但缺账号
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return 1
+    result["ready"] = True
+    result["hint"] = "✅ QMT 环境就绪（路径自动发现，终端已连接，账号已配置）"
+    print(json.dumps(result, ensure_ascii=False, indent=2)); return 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    """独立探针：连接 QMT → 下100股 → 撤单，验证下单链路（不依赖策略）"""
+    import platform as _plat, subprocess as _sp
+    is_mock = args.mock or _plat.system() != "Windows"
+    qmt_path = _auto_discover_qmt_path()
+    account_id = args.account_id or os.getenv("QMT_ACCOUNT_ID", "")
+    if not is_mock and not qmt_path:
+        print(json.dumps({"status": "error", "error": "未找到 QMT 路径"}, ensure_ascii=False)); return 1
+    if not is_mock and not account_id:
+        print(json.dumps({"status": "error", "error": "缺少资金账号 --account-id / QMT_ACCOUNT_ID"}, ensure_ascii=False)); return 1
+    probe_dir = RUNS_DIR / f"probe_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, str(BACKTESTS_DIR / "trade_runner.py"),
+        "--probe-only", "--symbols", args.symbol, "--state-dir", str(probe_dir)]
+    if qmt_path: cmd.extend(["--qmt-path", qmt_path])
+    if account_id: cmd.extend(["--account-id", account_id])
+    if is_mock: cmd.append("--mock")
+    result = _sp.run(cmd, capture_output=True, text=True, timeout=60, cwd=str(BACKTESTS_DIR))
+    state_file = probe_dir / "trade_state.json"
+    if state_file.exists():
+        state = read_json(state_file)
+        state["stdout_tail"] = result.stdout.strip().split("\n")[-10:]
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0 if state.get("probe_ok") or state.get("status") == "probe_done" else 1
+    print(json.dumps({"status": "error", "error": "探针进程未产生状态文件", "stdout": result.stdout[-500:], "stderr": result.stderr[-500:]}, ensure_ascii=False))
+    return 1
 
 def cmd_trade(args: argparse.Namespace) -> int:
     """启动实盘/模拟交易"""
@@ -2282,6 +2334,8 @@ def cmd_trade(args: argparse.Namespace) -> int:
     if not Path(strategy_file).exists():
         print(json.dumps({"status": "error", "error": f"策略文件不存在: {strategy_file}"}, ensure_ascii=False)); return 1
     is_mock = args.mock or _plat.system() != "Windows"
+    qmt_path = _auto_discover_qmt_path()
+    account_id = getattr(args, "account_id", "") or os.getenv("QMT_ACCOUNT_ID", "")
     if _plat.system() != "Windows" and not args.mock:
         print(json.dumps({"status": "platform_redirect", "hint": "模拟/实盘交易需在 Windows + QMT 环境运行", "mock_available": True,
             "command": f'python "{BACKTESTS_DIR / "pipeline_orchestrator.py"}" trade --run-id {args.run_id or ""} --strategy-file "{strategy_file}" --strategy-class {strategy_class} --symbols "{symbols}"'}, ensure_ascii=False))
@@ -2294,6 +2348,8 @@ def cmd_trade(args: argparse.Namespace) -> int:
         "--symbols", symbols, "--mode", mode, "--interval", interval,
         "--capital", str(args.capital), "--state-dir", str(trade_dir),
         "--datafeed-token", token]
+    if qmt_path: cmd.extend(["--qmt-path", qmt_path])
+    if account_id: cmd.extend(["--account-id", account_id])
     if is_mock: cmd.append("--mock")
     log_file = trade_dir / "trade.log"
     p_log = open(log_file, "w", encoding="utf-8")
@@ -2339,6 +2395,8 @@ def main() -> int:
         return cmd_config_doctor(args)
     if args.cmd == "qmt-check":
         return cmd_qmt_check(args)
+    if args.cmd == "probe":
+        return cmd_probe(args)
     if args.cmd == "trade":
         return cmd_trade(args)
     if args.cmd == "trade-stop":
