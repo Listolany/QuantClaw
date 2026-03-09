@@ -621,6 +621,38 @@ def pick_free_port(candidates: Optional[list[int]] = None) -> int:
     tried = ",".join(str(p) for p in ports)
     raise RuntimeError(f"白名单端口均被占用({tried})，请释放端口或通过 ORCH_MONITOR_PORT_CANDIDATES 扩展白名单")
 
+def _is_port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.8); return sock.connect_ex((host, int(port))) == 0
+    except Exception: return False
+
+def _read_monitor_state_by_port(port: int, timeout: float = 0.8) -> Optional[Dict[str, Any]]:
+    try:
+        with urlopen(f"http://127.0.0.1:{int(port)}/api/state", timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return data if isinstance(data, dict) else None
+    except Exception: return None
+
+def _kill_port_process(port: int) -> bool:
+    if not _is_port_busy(port): return True
+    for _ in range(3):
+        try: subprocess.run(f"lsof -ti:{int(port)} | xargs -r kill -9 2>/dev/null || fuser -k {int(port)}/tcp 2>/dev/null", shell=True, timeout=5, capture_output=True, text=True)
+        except Exception: pass
+        time.sleep(0.4)
+        if not _is_port_busy(port): return True
+    return False
+
+def try_reclaim_done_monitor_ports(candidates: list[int]) -> list[int]:
+    reclaimed = []
+    for p in candidates:
+        if not _is_port_busy(p): continue
+        st = _read_monitor_state_by_port(p)
+        if not st: continue
+        done = bool(st.get("done")) or str(st.get("status", "")).lower() in {"done", "failed", "completed"}
+        if done and _kill_port_process(p): reclaimed.append(p)
+    return reclaimed
+
 
 def monitor_get(base_url: str, path: str, timeout: float = 3.0) -> Optional[str]:
     try:
@@ -735,18 +767,90 @@ def _autofix_imports(source: str, mode: str = "cta") -> tuple[str, list[str]]:
 def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
     """策略代码静态检查——在py_compile之后、submit之前执行。blocker=必崩抛异常，warning=仅日志(运行时有兜底)"""
     warnings, blockers = [], []
+    source_no_comment = "\n".join(line.split("#")[0] for line in source.splitlines())
+    # ── 通用 blocker：错误包路径 ──
     if "vnpy.trading." in source:
         blockers.append("错误包路径 vnpy.trading.*，应为 vnpy.trader.*")
-    if re.search(r"from\s+vnpy\.app\.", source): #autofix未覆盖的vnpy.app.*残留
+    if re.search(r"from\s+vnpy\.app\.", source):
         blockers.append("错误包路径 vnpy.app.*，此环境应使用 vnpy_ctastrategy/vnpy_portfoliostrategy")
     if "am.ma(" in source:
         blockers.append("vnpy无am.ma()方法，应使用am.sma()")
     if mode == "portfolio" and re.search(r"from\s+vnpy_portfoliostrategy\s+import\s+.*\bSignal\b", source):
         blockers.append("无效导入 Signal（vnpy_portfoliostrategy 不提供该符号）")
-    if re.search(r'pro\.(ths_member|ths_index|dc_member|tdx_member|dc_index|tdx_index)\s*\(', source): #板块API应由引擎调用
+    if re.search(r'pro\.(ths_member|ths_index|dc_member|tdx_member|dc_index|tdx_index)\s*\(', source):
         blockers.append("策略内禁止调用板块API(ths_member等)，成分股由引擎通过--symbols自动传入")
-    if mode == "portfolio" and re.search(r'self\.vt_symbols\s*=[^=]', source): #股票池所有权契约
+    if mode == "portfolio" and re.search(r'self\.vt_symbols\s*=[^=]', source):
         blockers.append("Portfolio策略禁止覆盖self.vt_symbols，必须使用引擎传入的列表")
+    # ── blocker/warning：am.sma(n, 1) 第二参数误传整数——LLM高频错误，1被解读为array=True返回numpy数组 ──
+    _am_int_pat = re.compile(r'(?:self\.)?am\.(?:sma|ema|rsi|cci|atr)\s*\([^)]*,\s*\d+\s*\)')
+    _am_int_matches = list(_am_int_pat.finditer(source_no_comment))
+    if _am_int_matches:
+        _msg = "am.sma/ema/rsi/cci/atr(n, 1)第二参数是array:bool而非偏移量，1=True会返回numpy数组。取前值请用self.prev_xxx=self.xxx模式暂存"
+        _all_safe = True
+        for m in _am_int_matches:
+            line = source_no_comment[:m.end()].rsplit('\n', 1)[-1] + source_no_comment[m.end():].split('\n', 1)[0]
+            if not re.search(r'\)\s*\[', line[line.find(m.group()):]):
+                assign_m = re.search(r'(\w+)\s*=\s*' + re.escape(m.group()), source_no_comment)
+                if assign_m:
+                    vname = assign_m.group(1)
+                    if not (re.search(rf'(?:float|int)\s*\([^)]*\b{re.escape(vname)}\b', source_no_comment) or re.search(rf'\b{re.escape(vname)}\b\s*\[', source_no_comment)):
+                        _all_safe = False; break
+                else:
+                    _all_safe = False; break
+        if _all_safe:
+            warnings.append(_msg + "（检测到标量提取兜底，降级为告警）")
+        else:
+            blockers.append(_msg)
+    # ── blocker：bar.close/open/high/low 应为 bar.close_price 等 ──
+    if re.search(r'\bbar\.(close|open|high|low)\b(?!_price)', source_no_comment):
+        blockers.append("BarData属性应为bar.close_price/open_price/high_price/low_price，不是bar.close/open/high/low")
+    # ── blocker：__init__ 签名参数不足（CTA/Portfolio均需self+4个参数，不管有没有继承模板类） ──
+    init_m = re.search(r'def\s+__init__\s*\(([^)]*)\)', source)
+    if init_m:
+        params = [p.strip() for p in init_m.group(1).split(',') if p.strip()]
+        if len(params) < 5:
+            sig = "(self, cta_engine, strategy_name, vt_symbol, setting)" if mode == "cta" else "(self, strategy_engine, strategy_name, vt_symbols, setting)"
+            blockers.append(f"策略__init__需要{sig}共5个参数，当前仅{len(params)}个")
+    # ── blocker：CTA策略缺少on_init（抽象方法，缺失则无法实例化） ──
+    if mode == "cta" and "CtaTemplate" in source and "def on_init" not in source:
+        blockers.append("CTA策略必须实现on_init(self)方法，否则无法实例化(abstract method)")
+    if mode == "portfolio" and "StrategyTemplate" in source and "def on_init" not in source:
+        blockers.append("Portfolio策略必须实现on_init(self)方法，否则无法实例化(abstract method)")
+    # ── blocker：裸引用vt_symbols而非self.vt_symbols（排除__init__体+函数签名+super调用） ──
+    _bare_vt = False
+    _cur_func = ""
+    for line in source_no_comment.splitlines():
+        stripped = line.strip()
+        fn_m = re.match(r'def\s+(\w+)\s*\(', stripped)
+        if fn_m: _cur_func = fn_m.group(1); continue
+        if _cur_func == '__init__': continue
+        if stripped.startswith('class '): continue
+        if 'super().__init__' in stripped: continue
+        if 'vt_symbols' in stripped and 'self.vt_symbols' not in stripped:
+            _bare_vt = True; break
+    if _bare_vt:
+        blockers.append("裸引用vt_symbols应为self.vt_symbols（方法体内无此局部变量会NameError）")
+    # ── blocker：strategy内使用不存在的get_bars方法 ──
+    if re.search(r'self\.get_bars\s*\(', source_no_comment):
+        blockers.append("不存在self.get_bars()方法——CTA用self.load_bar(N)，Portfolio用self.load_bars(days)")
+    # ── blocker：numpy数组变量直接参与and/or布尔运算（排除[-N]/len()/float()等标量提取场景） ──
+    _am_vars = set()
+    for m in re.finditer(r'(\w+)\s*=\s*(?:self\.)?am\.(?:sma|ema|rsi|cci|atr|boll|keltner|donchian|macd)\s*\(([^)]*)\)', source_no_comment):
+        vname, args = m.group(1), m.group(2)
+        if 'array' in args and 'True' in args:
+            full_assign = m.group(0)
+            if not re.search(r'\)\s*\[', source_no_comment[m.end()-1:m.end()+5]):
+                _am_vars.add(vname)
+    for var in _am_vars:
+        for line in source_no_comment.splitlines():
+            if re.search(rf'\b(?:and|or)\b', line) and re.search(rf'\b{re.escape(var)}\b', line):
+                if re.search(rf'(?:len|float|int)\s*\(\s*(?:self\.)?{re.escape(var)}\b', line): continue
+                if re.search(rf'(?:self\.)?{re.escape(var)}\s*\[', line): continue
+                if re.search(rf'(?:self\.)?{re.escape(var)}\s+is\s+(?:None|not)', line): continue
+                blockers.append(f"变量{var}来自am.xxx(array=True)返回numpy数组，不能用Python and/or做布尔运算——改用[-1]取标量或numpy逻辑运算")
+                break
+        if blockers and blockers[-1].startswith(f"变量{var}"): break
+    # ── 模式相关 warning ──
     if mode == "cta":
         if "ArrayManager" in source and "update_bar" not in source:
             warnings.append("使用了ArrayManager但未调用am.update_bar(bar)——运行时会自动注入兜底")
@@ -763,30 +867,69 @@ def _lint_strategy(source: str, filename: str, mode: str = "cta") -> None:
             warnings.append("Portfolio策略应用self.get_pos(vt_symbol)而非self.pos")
     if "fixed_size" in source and "= 1" in source:
         warnings.append("fixed_size=1是玩具逻辑，应按资金动态计算")
-    source_no_comment = "\n".join(line.split("#")[0] for line in source.splitlines()) #排除注释行内容
-    if re.findall(r'["\'](\d{6})\.(SH|SZ)["\']', source_no_comment): #SH/SZ格式应为SSE/SZSE
+    if re.findall(r'["\'](\d{6})\.(SH|SZ)["\']', source_no_comment):
         warnings.append("标的代码应使用vnpy格式(.SSE/.SZSE)而非qgdata格式(.SH/.SZ)——运行时会自动转换")
-    if re.search(r'(?:start_date|end_date|begin_date)\s*=\s*["\']20\d{6}["\']', source): #硬编码日期
+    if re.search(r'(?:start_date|end_date|begin_date)\s*=\s*["\']20\d{6}["\']', source):
         warnings.append("策略内不建议硬编码日期，回测区间由--start/--end参数控制")
-    if mode == "portfolio" and re.search(r'self\.capital\b', source): #self.capital应为available_cash
+    if mode == "portfolio" and re.search(r'self\.capital\b', source):
         in_params = False
         for line in source.splitlines():
             stripped = line.strip()
-            if stripped.startswith("parameters") and "=" in stripped:
-                in_params = True
+            if stripped.startswith("parameters") and "=" in stripped: in_params = True
             if in_params:
-                if "]" in stripped:
-                    in_params = False
+                if "]" in stripped: in_params = False
                 continue
             if "self.capital" in stripped:
                 warnings.append("请用self.available_cash替代self.capital(固定值)——运行时会自动注入兜底")
                 break
+    # ── blocker：direction.name == "BUY"/"SELL" 误用vnpy枚举（应为"LONG"/"SHORT"） ──
+    if re.search(r'direction\.name\s*==\s*["\'](?:BUY|SELL|Buy|Sell)["\']', source_no_comment):
+        blockers.append('direction.name=="BUY"/"SELL"错误——vnpy的Direction枚举是LONG/SHORT，应改为direction==Direction.LONG或direction.name=="LONG"')
+    if re.search(r'direction\s*==\s*["\'](?:BUY|SELL|LONG|SHORT|买入|卖出)["\']', source_no_comment):
+        blockers.append('direction=="BUY"字符串比较错误——direction是Direction枚举，应用direction==Direction.LONG比较')
+    # ── warning：on_trade中手动覆盖self.pos（engine自动管理pos，手动覆盖易冲突） ──
+    _in_on_trade = False
+    for line in source_no_comment.splitlines():
+        stripped = line.strip()
+        if re.match(r'def\s+on_trade\s*\(', stripped): _in_on_trade = True; continue
+        if _in_on_trade and re.match(r'def\s+\w+\s*\(', stripped): _in_on_trade = False
+        if _in_on_trade and re.search(r'self\.pos\s*=(?!=)', stripped):
+            warnings.append("on_trade中手动赋值self.pos会覆盖引擎自动仓位管理——CTA策略引擎已自动跟踪pos，除非明确需要自定义逻辑否则应删除")
+            break
     if warnings:
         print(f"[lint] 策略({filename}){len(warnings)}个告警(运行时兜底):\n" + "\n".join(f"  ⚠ {w}" for w in warnings))
     if blockers:
         msg = f"策略({filename}){len(blockers)}个阻断(必崩):\n" + "\n".join(f"  ✗ {w}" for w in blockers)
         print(f"[lint] {msg}")
         raise ValueError(msg)
+
+
+def _validate_result(summary: dict, report_data: dict, mode: str = "cta") -> list:
+    """回测结果语义校验——不阻断，返回 warning 列表"""
+    warnings = []
+    stats = summary.get("stats", {})
+    trades = report_data.get("trades", [])
+    total_trade = int(stats.get("total_trade_count", 0))
+    if total_trade == 0: #零交易检测
+        warnings.append("策略未产生任何交易（0笔），可能参数窗口过大或信号逻辑有误")
+    if trades and total_trade > 0: #单边信号检测
+        dirs = {t.get("direction", "").upper() for t in trades}
+        has_long = bool(dirs & {"BUY", "LONG", "买入"})
+        has_short = bool(dirs & {"SELL", "SHORT", "卖出"})
+        if has_long and not has_short:
+            warnings.append(f"策略仅有买入({total_trade}笔)无任何卖出——可能存在仓位管理bug或卖出条件永不触发")
+        elif has_short and not has_long:
+            warnings.append(f"策略仅有卖出({total_trade}笔)无任何买入——可能存在信号逻辑bug")
+    wr = stats.get("winning_rate") #胜率极端值检测
+    if wr is not None:
+        try:
+            wr_f = float(wr)
+            if total_trade >= 5 and wr_f >= 100.0:
+                warnings.append(f"胜率100%（{total_trade}笔交易），可能存在未来函数或逻辑漏洞")
+            elif total_trade >= 10 and wr_f == 0.0:
+                warnings.append(f"胜率0%（{total_trade}笔交易），策略逻辑可能存在严重问题")
+        except (ValueError, TypeError): pass
+    return warnings
 
 
 def _preflight_strategy_import(module_name: str, python_bin: str) -> None:
@@ -884,7 +1027,7 @@ body{{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc;color:#1
 .mc{{background:#fff;border-radius:14px;padding:18px;text-align:center;border:1px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.04)}}
 .mc .lb{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;font-weight:600}}
 .mc .vl{{font-size:24px;font-weight:800;margin-top:6px}}
-.mc .vl.pos{{color:#16a34a}}.mc .vl.neg{{color:#dc2626}}.mc .vl.neu{{color:#475569}}
+.mc .vl.pos{{color:#dc2626}}.mc .vl.neg{{color:#16a34a}}.mc .vl.neu{{color:#475569}}
 .tabs{{display:flex;gap:4px;background:#fff;border-radius:12px;padding:4px;border:1px solid #e2e8f0;margin-bottom:20px}}
 .tab{{padding:10px 20px;border-radius:8px;border:none;background:transparent;cursor:pointer;font-size:14px;font-weight:600;color:#64748b;transition:all .2s}}
 .tab.active{{background:#2563eb;color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.25)}}
@@ -897,7 +1040,7 @@ body{{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc;color:#1
 .tt th{{background:#f8fafc;color:#64748b;font-weight:600;text-align:left;padding:12px 14px;border-bottom:2px solid #e2e8f0;font-size:11px;text-transform:uppercase}}
 .tt td{{padding:12px 14px;border-bottom:1px solid #f1f5f9}}
 .tt tr:hover{{background:#f8fafc}}
-.tt .buy{{color:#16a34a;font-weight:600}}.tt .sell{{color:#dc2626;font-weight:600}}
+.tt .buy{{color:#dc2626;font-weight:600}}.tt .sell{{color:#16a34a;font-weight:600}}
 .pn{{display:flex;justify-content:center;gap:6px;margin-top:14px}}
 .pn button{{padding:6px 12px;border:1px solid #e2e8f0;background:#fff;border-radius:6px;cursor:pointer;font-size:12px}}
 .pn button.act{{background:#2563eb;color:#fff;border-color:#2563eb}}
@@ -930,7 +1073,7 @@ const D={dates_json},N={navs_json},B={bench_json},T={trades_json},S={stats_json}
 (function(){{
 const fmt={{total_return:['总收益率',1],annual_return:['年化收益',1],max_ddpercent:['最大回撤',1],sharpe_ratio:['夏普比率',0],total_trade_count:['交易次数',0],winning_rate:['胜率',1],profit_days:['盈利天数',0],loss_days:['亏损天数',0]}};
 let h='';for(const[k,[lb,isPct]] of Object.entries(fmt)){{const v=S[k];if(v===undefined)continue;
-const n=typeof v==='number';let d=n?(isPct?v.toFixed(2)+'%':v.toFixed(4)):v;
+const n=typeof v==='number';let d=n?(isPct?v.toFixed(2)+'%':v.toFixed(2)):v;
 const c=n?(v>=0?'pos':'neg'):'neu';h+='<div class="mc"><div class="lb">'+lb+'</div><div class="vl '+c+'">'+d+'</div></div>'}}
 document.getElementById('metricsRow').innerHTML=h}})();
 /* --- tabs --- */
@@ -952,7 +1095,7 @@ const dd=[],dl=[];for(let i=1;i<N.length&&i<D.length;i++){{const p=N[i-1]||1;dd.
 dc.setOption({{animation:true,tooltip:{{trigger:'axis'}},grid:{{left:56,right:24,top:36,bottom:48}},
 xAxis:{{type:'category',data:dl,axisLabel:{{color:'#94a3b8',fontSize:10}}}},
 yAxis:{{type:'value',name:'日收益%',axisLabel:{{color:'#64748b',formatter:v=>v.toFixed(2)+'%'}},splitLine:{{lineStyle:{{color:'#f1f5f9'}}}}}},
-series:[{{type:'bar',data:dd.map(v=>parseFloat(v)),itemStyle:{{color:function(p){{return p.data>=0?'#16a34a':'#dc2626'}}}},barWidth:'60%'}}]}});
+series:[{{type:'bar',data:dd.map(v=>parseFloat(v)),itemStyle:{{color:function(p){{return p.data>=0?'#dc2626':'#16a34a'}}}},barWidth:'60%'}}]}});
 window.addEventListener('resize',()=>{{ch.resize();dc.resize()}})
 }})();
 /* --- trades --- */
@@ -961,7 +1104,7 @@ let pg=1;const ps=15;
 function render(){{
 const s=(pg-1)*ps,page=T.slice(s,s+ps);
 let h='<table class="tt"><thead><tr><th>日期</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th><th>金额</th><th>盈亏</th></tr></thead><tbody>';
-page.forEach(t=>{{const ib=t.direction==='买入'||t.direction==='BUY';const pnl=t.pnl||'';const ps=pnl?(parseFloat(pnl)>=0?'color:#16a34a;font-weight:600':'color:#dc2626;font-weight:600'):'';const sym=t.symbol||'';h+='<tr><td>'+t.date+'</td><td>'+sym+'</td><td class="'+(ib?'buy':'sell')+'">'+(ib?'买入':'卖出')+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td><td style="'+ps+'">'+pnl+'</td></tr>'}});
+page.forEach(t=>{{const ib=t.direction==='买入'||t.direction==='BUY';const pnl=t.pnl||'';const ps=pnl?(parseFloat(pnl)>=0?'color:#dc2626;font-weight:600':'color:#16a34a;font-weight:600'):'';const sym=t.symbol||'';h+='<tr><td>'+t.date+'</td><td>'+sym+'</td><td class="'+(ib?'buy':'sell')+'">'+(ib?'买入':'卖出')+'</td><td>'+t.price+'</td><td>'+t.volume+'</td><td>'+t.amount+'</td><td style="'+ps+'">'+pnl+'</td></tr>'}});
 h+='</tbody></table>';document.getElementById('tradeArea').innerHTML=h||'<div style="color:#94a3b8;text-align:center;padding:40px">暂无交易记录</div>';
 const tp=Math.ceil(T.length/ps),nav=document.getElementById('tradeNav');
 if(tp>1){{let p='';for(let i=1;i<=tp;i++)p+='<button class="'+(i===pg?'act':'')+'" onclick="window._tp('+i+')">'+i+'</button>';nav.innerHTML=p}}else nav.innerHTML=''}}
@@ -1229,7 +1372,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     print(f"[token] source={token_source}, token={mask_token(resolved_token)}")
     parsed = parse_requirement(args.requirement, args.symbols, resolved_token)
     if parsed.get("data_blocked"):
-        print(json.dumps({"status": "data_auth_failed", "error": parsed.get("pool_warning", "数据服务不可用"), "next_action": f"请配置有效Token或到 {QGDATA_RECHARGE_URL} 充值后重试", "token_source": token_source}, ensure_ascii=False))
+        _err = parsed.get("pool_warning", "数据服务不可用")
+        _is_quota = any(k in str(_err) for k in ["额度已达上限", "额度不足", "quota", "rate limit", "too many requests", "429"])
+        _next = f"请配置有效Token或到 {QGDATA_RECHARGE_URL} 充值后重试"
+        if _is_quota and token_source == "shared":
+            _next = f"今日免费额度已用完（1次/天）。升级数据套餐可解除限制：{QGDATA_RECHARGE_URL}"
+        print(json.dumps({"status": "data_auth_failed", "error": _err, "next_action": _next, "token_source": token_source}, ensure_ascii=False))
         return 2
     cap = evaluate_requirement(args.requirement).to_dict()
     if not cap.get("ok", False):
@@ -1252,7 +1400,28 @@ def cmd_submit(args: argparse.Namespace) -> int:
             if tok:
                 try: candidate_ports.append(int(tok))
                 except ValueError: pass
-    monitor_port = args.monitor_port or pick_free_port(candidate_ports or None)
+    try:
+        if args.monitor_port:
+            monitor_port = args.monitor_port
+            if _is_port_busy(monitor_port):
+                st = _read_monitor_state_by_port(monitor_port)
+                if st and (bool(st.get("done")) or str(st.get("status", "")).lower() in {"done", "failed", "completed"}):
+                    _kill_port_process(monitor_port)
+        else:
+            pool = candidate_ports or DEFAULT_MONITOR_PORTS
+            try: monitor_port = pick_free_port(pool)
+            except RuntimeError:
+                reclaimed = try_reclaim_done_monitor_ports(pool)
+                if reclaimed: monitor_port = pick_free_port(pool)
+                else: raise
+    except RuntimeError as exc:
+        print(json.dumps({
+            "status": "port_unavailable",
+            "error": str(exc),
+            "monitor_port_candidates": (candidate_ports or DEFAULT_MONITOR_PORTS),
+            "next_action": "存在进行中的监控占用端口；可等待运行结束，或扩展 ORCH_MONITOR_PORT_CANDIDATES（例如 8761,8767）",
+        }, ensure_ascii=False))
+        return 1
     monitor_base = f"http://127.0.0.1:{monitor_port}"
     monitor_url = f"{resolved_monitor_public_base.rstrip('/')}:{monitor_port}/runs/{run_id}"
     monitor_url_local = f"http://127.0.0.1:{monitor_port}/runs/{run_id}"
@@ -1370,6 +1539,51 @@ def cmd_submit(args: argparse.Namespace) -> int:
     state["status"] = "running"
     store.save(state)
 
+    # ── 同步等待预检（compile→lint→dryrun）完成再返回 ──
+    _pf_base = 180
+    _pf_extra = int(os.getenv("PRECHECK_TIMEOUT_SEC", "0"))
+    if parsed.get("mode") == "portfolio": _pf_base = 300 #portfolio数据量大，dryrun更久
+    _pf_deadline = time.time() + max(_pf_base, _pf_extra)
+    _pf_ok = False
+    _worker_gone = False
+    def _resolve_sf() -> str: #预检失败时回填strategy_file（自动生成分支submit时strategy_file为空）
+        if strategy_file: return strategy_file
+        try: return store.load().get("artifacts", {}).get("strategy_file", "")
+        except Exception: return ""
+    while time.time() < _pf_deadline:
+        time.sleep(0.5)
+        raw = monitor_get(monitor_base, "/api/state", timeout=2.0)
+        if raw:
+            try: ms = json.loads(raw)
+            except Exception: ms = {}
+            steps = ms.get("steps", {})
+            err = ms.get("error")
+            if steps.get("3", {}).get("status") == "success" or steps.get("4", {}).get("status") in ("running", "success"): #dryrun通过 or 回测已启动
+                _pf_ok = True; break
+            if err and err.get("error_type"): #compile/lint/dryrun失败
+                try: mon_proc.kill(); mon_proc.wait()
+                except Exception: pass
+                print(json.dumps({
+                    "status": err["error_type"], "run_id": run_id,
+                    "error": err.get("message", ""), "traceback": err.get("traceback", "")[:2000],
+                    "strategy_file": _resolve_sf(), "next_action": "读取错误信息和策略文件，修复后重新submit",
+                }, ensure_ascii=False))
+                return 1
+        if worker_proc.poll() is not None:
+            if _worker_gone: break #已等过一轮grace period仍无结果
+            _worker_gone = True; continue #再poll一次让最后的HTTP到达monitor
+    if not _pf_ok: #超时或worker异常退出
+        try: mon_proc.kill(); mon_proc.wait()
+        except Exception: pass
+        try: worker_proc.kill(); worker_proc.wait()
+        except Exception: pass
+        print(json.dumps({
+            "status": "timeout_error", "run_id": run_id,
+            "error": "预检超时（编译/静态检查/冒烟测试未在限定时间内完成）",
+            "strategy_file": _resolve_sf(), "next_action": "检查策略代码是否有死循环或网络依赖",
+        }, ensure_ascii=False))
+        return 1
+
     submit_result = {
         "status": "accepted",
         "run_id": run_id,
@@ -1481,7 +1695,56 @@ def cmd_worker(args: argparse.Namespace) -> int:
             store.mark_step(state, "strategy_generation", "success", strategy_file_path.name)
 
         _validate_engine_compat(parsed.get("mode", "cta"), payload["interval"])
-        monitor_step(monitor_base, step="3", status="success", title="策略就绪", msg=f"策略已就绪: {module_name}.{class_name}", run_id=run_id)
+
+        # ── dry run: 采样标的 + K线冒烟测试 ──
+        _am_size = 50 #默认预热长度
+        _sf = state.get("artifacts", {}).get("strategy_file", "")
+        if _sf and Path(_sf).exists():
+            _src = Path(_sf).read_text(encoding="utf-8", errors="replace")
+            _m = re.search(r'ArrayManager\s*\(\s*(?:size\s*=\s*)?(\d+)', _src)
+            if _m: _am_size = max(_am_size, int(_m.group(1)))
+        _dry_max_bars = _am_size + 20 #预热+至少20根交易K线触发策略逻辑
+        _dry_sym_limit = 5
+        _dry_syms = parsed["symbols"][:_dry_sym_limit] if len(parsed["symbols"]) > _dry_sym_limit else parsed["symbols"]
+        monitor_step(monitor_base, step="3", status="running", title="冒烟测试", msg=f"采样{len(_dry_syms)}只标的×{_dry_max_bars}根K线验证", run_id=run_id)
+        _dry_cmd = [payload["python_bin"], str(BACKTEST_RUNNER),
+            "--strategy", module_name, "--class", class_name,
+            "--symbols", ",".join(_dry_syms), "--mode", parsed.get("mode", "cta"),
+            "--interval", payload["interval"], "--capital", str(payload["capital"]),
+            "--rate", str(payload["rate"]), "--slippage", str(payload["slippage"]),
+            "--size", str(payload["size"]), "--pricetick", str(payload["pricetick"]),
+            "--max-bars", str(_dry_max_bars), "--run-id", f"{run_id}_dryrun"]
+        if payload.get("start"): _dry_cmd.extend(["--start", payload["start"]])
+        if payload.get("end"): _dry_cmd.extend(["--end", payload["end"]])
+        if qgdata_token: _dry_cmd.extend(["--token", qgdata_token])
+        _dry_env = {**os.environ, "QUANTCLAW_ROOT": str(PROJECT_ROOT), "QMT_PROJECT_ROOT": str(PROJECT_ROOT)}
+        _dry_log = store.run_dir / "dryrun.log"
+        _dry_proc = start_process(_dry_cmd, _dry_log, env=_dry_env)
+        _dry_timeout = 120
+        _dry_t0 = time.time()
+        while _dry_proc.poll() is None:
+            if time.time() - _dry_t0 > _dry_timeout: _dry_proc.kill(); break
+            time.sleep(1)
+        _dry_proc.wait() #reap子进程，确保returncode不为None
+        _dry_ret = _dry_proc.returncode
+        if _dry_ret != 0:
+            _dry_output = _dry_log.read_text(encoding="utf-8", errors="replace")[-2000:] if _dry_log.exists() else ""
+            _dry_tb = ""; _dry_msg = f"dry run exit code={_dry_ret}"
+            for line in reversed(_dry_output.splitlines()):
+                line = line.strip()
+                if line and ("Error" in line or "error" in line) and not line.startswith("["):
+                    _dry_msg = line[:200]; break
+            for i, line in enumerate(_dry_output.splitlines()):
+                if "Traceback" in line: _dry_tb = "\n".join(_dry_output.splitlines()[i:]); break
+            _structured_error(state, "dryrun_error", "strategy_dryrun", _dry_msg, _dry_tb)
+            state["status"] = "failed"
+            _fail_report(state, _dry_msg)
+            monitor_step(monitor_base, step="3", status="failed", title="冒烟测试失败", msg=_dry_msg[:200], run_id=run_id)
+            store.save(state)
+            return 1
+        monitor_step(monitor_base, step="3", status="success", title="冒烟测试通过", msg=f"{len(_dry_syms)}只标的×{_dry_max_bars}根K线无异常", run_id=run_id)
+        print(f"[dry-run] 通过 ({len(_dry_syms)}只标的×{_dry_max_bars}根K线, {int(time.time()-_dry_t0)}秒)")
+
         monitor_step(monitor_base, step="4", status="running", title="回测执行", msg="回测已启动", run_id=run_id)
         cmd = [
             payload["python_bin"],
@@ -1549,7 +1812,17 @@ def cmd_worker(args: argparse.Namespace) -> int:
             state["artifacts"]["summary"] = summary
             report_data_path = BACKTESTS_DIR / f"{output_prefix}_report_data.json"
             report_data = read_json(report_data_path) if report_data_path.exists() else {}
-            strategy_code = ""
+            result_warnings = _validate_result(summary, report_data, parsed.get("mode", "cta")) #Step5: 结果校验
+            if result_warnings:
+                state["result_warnings"] = result_warnings
+                warn_msg = "结果校验告警:\n" + "\n".join(f"  ⚠ {w}" for w in result_warnings)
+                print(f"[validate] {warn_msg}", flush=True)
+                monitor_post(monitor_base, "/api/log", {"msg": warn_msg})
+                monitor_post(monitor_base, "/api/result_warnings", {"warnings": result_warnings})
+                monitor_step(monitor_base, step="5", status="warning", title="结果校验", msg=f"发现{len(result_warnings)}个告警", run_id=run_id)
+            else:
+                monitor_step(monitor_base, step="5", status="success", title="结果校验", msg="校验通过", run_id=run_id)
+            strategy_code = "" #Step6: 生成报告
             sf = state["artifacts"].get("strategy_file", "")
             if sf and Path(sf).exists():
                 try: strategy_code = Path(sf).read_text(encoding="utf-8")
@@ -1578,7 +1851,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 "report_replay_url": payload.get("report_replay_url", ""),
                 "report_summary_url": payload.get("report_summary_url", ""),
             })
-            monitor_step(monitor_base, step="5", status="success", title="结果展示", msg="回测完成，结果已生成", run_id=run_id)
+            monitor_step(monitor_base, step="6", status="success", title="报告生成", msg="回测完成，结果已生成", run_id=run_id)
             store.mark_step(state, "result", "success", str(summary_path))
         else:
             store.mark_step(state, "result", "running", "summary pending")

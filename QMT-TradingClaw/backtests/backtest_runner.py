@@ -97,6 +97,30 @@ def _emit_progress(total_stages, done, total, tag="回测"):
     pct = int(done * 100 / total)
     p(f"[3/{total_stages}][running] {tag}进度 {done}/{total} {pct}% {_bar(done,total)}")
 
+_STOCK_NAME_MAP = {} #vt_symbol -> 中文名（回测启动时加载一次）
+def _load_stock_names(token: str = ""):
+    global _STOCK_NAME_MAP
+    if _STOCK_NAME_MAP: return
+    try:
+        import qgdata as qg
+        t = token or os.getenv("QGDATA_TOKEN", "")
+        if not t: return
+        qg.set_token(t); pro = qg.pro_api(timeout=15.0)
+        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
+        if df is not None and not df.empty:
+            for _, r in df.iterrows():
+                ts = str(r["ts_code"]); nm = str(r["name"])
+                parts = ts.split(".")
+                if len(parts) == 2:
+                    ex_map = {"SH": "SSE", "SZ": "SZSE"}
+                    vt = f"{parts[0]}.{ex_map.get(parts[1], parts[1])}"
+                    _STOCK_NAME_MAP[vt] = nm
+            p(f"[名称] 已加载{len(_STOCK_NAME_MAP)}只A股中文名称")
+    except Exception as e: p(f"[名称] 加载股票名称失败(不影响回测): {e}")
+def _sym_display(vt_symbol: str) -> str:
+    nm = _STOCK_NAME_MAP.get(vt_symbol, "")
+    return f"{nm}({vt_symbol})" if nm else vt_symbol
+
 def _serialize_trade_rows(trades):
     rows, pos_map, cost_map = [], {}, {}
     for t in sorted(list(trades or []), key=lambda x: getattr(x, "datetime", datetime.min)):
@@ -114,13 +138,13 @@ def _serialize_trade_rows(trades):
             pos = max(pos - volume, 0)
             if pos == 0: avg_cost = 0
         pos_map[sym], cost_map[sym] = pos, avg_cost
-        rows.append({"date": dt_str, "symbol": sym, "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}", "pnl": pnl})
+        rows.append({"date": dt_str, "symbol": _sym_display(sym), "direction": direction, "price": f"{price:.2f}", "volume": f"{volume:.0f}", "amount": f"{price * volume:.2f}", "pnl": pnl})
     return rows
 
 def _attach_progress(engine, mode, total_stages, capital=100000, size=1, vt_symbols=None):
     """挂钩回测引擎，按交易日推送净值/交易/持仓（日线每bar推一次，分钟线每日收盘推一次）"""
     state = {"done": 0, "last": -1, "trades_n": 0, "realized": 0.0, "pos": 0.0, "avg_cost": 0.0, "err": "",
-             "cur_date": None, "eod_close": 0.0, "eod_sym": ""}
+             "cur_date": None, "eod_close": 0.0, "eod_sym": "", "pcash": capital, "ptrade_n": 0, "pos_snaps": []}
     def _dkey(dt_obj):
         return dt_obj.date() if hasattr(dt_obj, 'date') else str(dt_obj)[:10]
     def _dstr(d):
@@ -144,7 +168,8 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1, vt_symb
         _report("/api/point", dt=date_str, nav=f"{nav:.6f}")
         if MONITOR: _report_post("/api/trades", {"trades": _serialize_trade_rows(trades)})
         if int(state["pos"]) > 0 and sym_hint:
-            _report_post("/api/position_snapshot", {"date": date_str, "positions": [{"symbol": sym_hint, "volume": int(state["pos"]), "price": f"{close_price:.2f}", "value": f"{state['pos'] * close_price:.0f}"}]})
+            snap = {"date": date_str, "positions": [{"symbol": _sym_display(sym_hint), "volume": int(state["pos"]), "price": f"{close_price:.2f}", "value": f"{state['pos'] * close_price:.0f}"}]}
+            _report_post("/api/position_snapshot", snap); state["pos_snaps"].append(snap)
     if mode == "cta":
         total = len(getattr(engine, "history_data", []) or [])
         con_step = max(total // 20, 1) if total else 1
@@ -187,16 +212,27 @@ def _attach_progress(engine, mode, total_stages, capital=100000, size=1, vt_symb
             cur = _dkey(dt)
             if MONITOR:
                 def _portfolio_eod(date_key):
-                    dt_s = _dstr(date_key)
-                    strat = engine.strategy
-                    _report_post("/api/trades", {"trades": _serialize_trade_rows(list(engine.trades.values()))})
+                    dt_s = _dstr(date_key); strat = engine.strategy
+                    trades = list(engine.trades.values())
+                    for t in trades[state["ptrade_n"]:]: #增量更新现金流(含佣金/滑点/合约乘数)
+                        vol, px, sym = float(t.volume), float(t.price), t.vt_symbol
+                        sz = engine.sizes.get(sym, 1); turnover = px * vol * sz
+                        cost = turnover * engine.rates.get(sym, 0) + vol * sz * engine.slippages.get(sym, 0)
+                        state["pcash"] += (-turnover if t.direction == Direction.LONG else turnover) - cost
+                    state["ptrade_n"] = len(trades)
+                    pos_val = 0 #持仓市值 = 各标的持仓量 × 最新收盘价 × 合约乘数
                     if strat and hasattr(strat, "get_pos"):
-                        pos_list = [{"symbol": s, "volume": strat.get_pos(s)} for s in vt_syms if strat.get_pos(s) != 0]
+                        for s in vt_syms:
+                            p = strat.get_pos(s)
+                            if p != 0 and s in engine.bars: pos_val += p * float(engine.bars[s].close_price) * engine.sizes.get(s, 1)
+                    nav = (state["pcash"] + pos_val) / capital
+                    _report("/api/point", dt=dt_s, nav=f"{nav:.6f}") #无条件推送净值
+                    if trades: _report_post("/api/trades", {"trades": _serialize_trade_rows(trades)})
+                    if strat and hasattr(strat, "get_pos"):
+                        pos_list = [{"symbol": _sym_display(s), "volume": strat.get_pos(s)} for s in vt_syms if strat.get_pos(s) != 0]
                         if pos_list:
-                            _report_post("/api/position_snapshot", {"date": dt_s, "positions": pos_list})
-                    tv = getattr(strat, "total_value", 0) if strat else 0
-                    if tv > 0:
-                        _report("/api/point", dt=dt_s, nav=f"{tv / capital:.6f}")
+                            snap = {"date": dt_s, "positions": pos_list}
+                            _report_post("/api/position_snapshot", snap); state["pos_snaps"].append(snap)
                 if state["cur_date"] is not None and cur != state["cur_date"]:
                     pct = 20 + int(60 * d / max(total, 1))
                     _report("/api/progress", run_id=RUN_ID, status="running", stage=f"Portfolio回放 {d}/{total}", pct=min(pct, 80))
@@ -583,7 +619,7 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
     p("[guard] 订单守卫已启用: 停牌废单 + 涨跌停按日懒加载缓存 + last_order_status")
 
 # ========== 回测 ==========
-def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, rate, slippage, size, pricetick, strategy_params, total_stages):
+def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, rate, slippage, size, pricetick, strategy_params, total_stages, max_bars=0):
     t0 = time.time()
     if mode == "cta":
         from vnpy_ctastrategy.backtesting import BacktestingEngine
@@ -609,6 +645,14 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
         engine.strategy.trade_calendar = trade_cal  # 策略可用 date_str in self.trade_calendar 判断交易日
     engine.load_data()
     bar_count = len(engine.history_data) if mode == "cta" else len(getattr(engine, "dts", []) or [])
+    if max_bars > 0 and bar_count > max_bars: #dry run: 截断数据只跑前N根
+        if mode == "cta":
+            engine.history_data = engine.history_data[:max_bars]
+        else:
+            _sorted_dts = sorted(engine.dts)[:max_bars]
+            engine.dts = set(_sorted_dts)
+        bar_count = max_bars
+        p(f"  [dry-run] 截断至{max_bars}根K线")
     p(f"  引擎参数: vt_symbols={vt_symbols} interval={interval} start={start} end={end}")
     p(f"  引擎加载K线数: {bar_count}")
     if bar_count == 0:
@@ -640,7 +684,7 @@ def run_backtest(mode, strategy_cls, vt_symbols, interval, start, end, capital, 
     trade_list = _extract_trades(engine)
     _push_trades(trade_list)
     stage(3, total_stages, "success", f"回测完成 收益={stats.get('total_return','N/A')} 夏普={stats.get('sharpe_ratio','N/A')}")
-    return df, stats, trade_list
+    return df, stats, trade_list, state.get("pos_snaps", [])
 
 # ========== 指标输出 ==========
 def print_stats(stats, total_stages):
@@ -711,12 +755,13 @@ def _push_final_nav(df, total_stages):
     _report_post("/api/final", data)
     _report("/api/log", msg="精确净值曲线已推送（含沪深300基准）")
 
-def _save_report_data(df, stats, trades, output_name):
+def _save_report_data(df, stats, trades, output_name, position_snapshots=None):
     if df is None or df.empty: return
     nav = df["balance"].astype(float) / float(df["balance"].iloc[0])
     bench = _load_hs300(nav.index.min(), nav.index.max())
     data = {"dates": [d.strftime("%Y-%m-%d") for d in nav.index], "navs": [round(float(v), 6) for v in nav.values], "bench": [], "trades": trades or [],
-        "stats": {k: (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in (stats or {}).items()}}
+        "stats": {k: (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in (stats or {}).items()},
+        "position_snapshots": position_snapshots or []}
     if bench is not None and len(bench) > 10:
         bnav = bench.reindex(nav.index).ffill().dropna().astype(float)
         data["bench"] = [round(float(v), 6) for v in (bnav / float(bnav.iloc[0])).values]
@@ -849,6 +894,7 @@ def main():
     ap.add_argument("--monitor-port", type=int, default=0, help="监控服务端口，0=不启动")
     ap.add_argument("--run-id", default="", help="覆盖run_id")
     ap.add_argument("--monitor-keepalive-sec", type=int, default=300, help="回测完成后监控保活秒数")
+    ap.add_argument("--max-bars", type=int, default=0, help="dry run模式：>0时仅回放前N根K线后退出，跳过报告生成")
     args = ap.parse_args()
 
     global RUN_ID
@@ -886,15 +932,19 @@ def main():
         if hit: p(f"  [warn] 类名修正: {args.cls} -> {hit[0]}"); strategy_cls = getattr(mod, hit[0])
         else: raise AttributeError(f"模块 {args.strategy} 中找不到类 {args.cls}，可用: {[n for n in dir(mod) if n[0].isupper() and 'Strategy' in n]}")
 
+    _dry = args.max_bars > 0
     acquire_lock()
     try:
         validate_token(args.token, TOTAL)
+        _load_stock_names(args.token)
         load_data(symbols_exchanges, interval, start, end, args.token, TOTAL)
-        df, stats, trade_list = run_backtest(args.mode, strategy_cls, vt_symbols, interval, start, end,
-            args.capital, args.rate, args.slippage, args.size, args.pricetick, strategy_params, TOTAL)
+        df, stats, trade_list, pos_snaps = run_backtest(args.mode, strategy_cls, vt_symbols, interval, start, end,
+            args.capital, args.rate, args.slippage, args.size, args.pricetick, strategy_params, TOTAL, max_bars=args.max_bars)
+        if _dry:
+            p(f"[dry-run] {args.max_bars}根K线回放完成，策略无运行时错误"); sys.exit(0)
         print_stats(stats, TOTAL)
         _push_final_nav(df, TOTAL)
-        _save_report_data(df, stats, trade_list, args.output)
+        _save_report_data(df, stats, trade_list, args.output, pos_snaps)
         plot_result(df, title, args.output, TOTAL)
     except Exception as e:
         import traceback; p(f"[failed] {type(e).__name__}: {e}"); p(traceback.format_exc()[-800:])
@@ -908,7 +958,7 @@ def main():
     p(f"[summary] {spath}")
     _report("/api/done")
     p("[完成] 回测结束")
-    if MONITOR and args.monitor_keepalive_sec > 0: # 保持监控页可查看
+    if MONITOR and args.monitor_keepalive_sec > 0:
         p(f"[monitor] 监控页保持{args.monitor_keepalive_sec}秒: {MONITOR}/runs/{RUN_ID}")
         try: time.sleep(args.monitor_keepalive_sec)
         except KeyboardInterrupt: pass

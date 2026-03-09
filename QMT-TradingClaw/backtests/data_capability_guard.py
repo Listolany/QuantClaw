@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Set
 
 
@@ -60,7 +62,7 @@ KEYWORD_API_RULES: Dict[str, List[str]] = {
 }
 
 # Keywords that usually imply out-of-scope or ambiguous requirement.
-from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error
+from qg_constants import QGDATA_RECHARGE_URL, QGDATA_SHARED_TOKEN, classify_qgdata_error
 
 UNSUPPORTED_HINTS: Dict[str, str] = {
     "期权": "当前编排器默认股票策略，期权需要单独执行链路。",
@@ -99,9 +101,10 @@ class CapabilityResult:
     matched_rules: List[str]
     unsupported_reasons: List[str]
     suggestion: str
+    token_hint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "ok": self.ok,
             "status": self.status,
             "required_apis": self.required_apis,
@@ -110,7 +113,38 @@ class CapabilityResult:
             "unsupported_reasons": self.unsupported_reasons,
             "suggestion": self.suggestion,
         }
+        if self.token_hint: d["token_hint"] = self.token_hint
+        return d
 
+
+_PORTFOLIO_STRONG = {"轮动", "组合", "多标的", "全市场", "等权", "仓位分配"}
+_PORTFOLIO_WEAK = {"排序", "筛选", "选股", "调仓", "排列", "持仓周期"}
+_PORTFOLIO_CTX = {"板块", "成分股", "指数", "行业", "概念", "股票池"}
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+def _looks_portfolio(text: str) -> bool:
+    if any(kw in text for kw in _PORTFOLIO_STRONG): return True
+    if re.search(r'前\s*\d+\s*名', text): return True
+    return any(kw in text for kw in _PORTFOLIO_WEAK) and any(kw in text for kw in _PORTFOLIO_CTX)
+
+def _read_env_value_from_files(key: str, candidates: list[Path]) -> str:
+    for path in candidates:
+        if not path.exists(): continue
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line: continue
+                k, v = line.split("=", 1)
+                if k.strip() == key: return v.strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return ""
+
+def _token_context() -> str:
+    env_tok = (os.getenv("QGDATA_TOKEN", "") or _read_env_value_from_files("QGDATA_TOKEN", [_PROJECT_ROOT / ".env", Path.home() / ".openclaw" / ".env", Path("/opt/.env")])).strip()
+    if not env_tok: return "missing" #未传token，将回退共享token
+    if env_tok == QGDATA_SHARED_TOKEN: return "shared"
+    return "personal"
 
 def evaluate_requirement(requirement: str) -> CapabilityResult:
     text = requirement.lower()
@@ -130,37 +164,30 @@ def evaluate_requirement(requirement: str) -> CapabilityResult:
     available = runtime_apis if runtime_apis else DOCUMENTED_APIS
     missing = sorted(api for api in required if api not in available)
 
+    token_hint = ""
+    _tok_ctx = _token_context()
+    if _looks_portfolio(requirement) and _tok_ctx != "personal":
+        token_hint = f"Portfolio策略需下载多只标的数据，API调用量较大。当前未传Token（将使用共享试用Token）或正在使用共享试用Token，每日调用频次有限，多标的回测可能因频率限制中断。建议前往 {QGDATA_RECHARGE_URL} 获取个人Token（免费注册即可提升频率上限）。"
+
     if unsupported:
         return CapabilityResult(
-            ok=False,
-            status="unsupported",
-            required_apis=sorted(required),
-            missing_apis=missing,
-            matched_rules=matched_rules,
-            unsupported_reasons=unsupported,
-            suggestion="请先改写需求为股票+文档内可用数据接口，或扩展数据源后再执行。",
+            ok=False, status="unsupported", required_apis=sorted(required), missing_apis=missing,
+            matched_rules=matched_rules, unsupported_reasons=unsupported,
+            suggestion="请先改写需求为股票+文档内可用数据接口，或扩展数据源后再执行。", token_hint=token_hint,
         )
 
     if missing:
         sug = f"当前需求依赖的部分数据接口不可用({', '.join(missing)})。请调整需求，或到 {QGDATA_RECHARGE_URL} 升级套餐启用缺失接口。"
         return CapabilityResult(
-            ok=False,
-            status="clarification_needed",
-            required_apis=sorted(required),
-            missing_apis=missing,
-            matched_rules=matched_rules,
-            unsupported_reasons=[token_warn] if token_warn else [],
-            suggestion=sug,
+            ok=False, status="clarification_needed", required_apis=sorted(required), missing_apis=missing,
+            matched_rules=matched_rules, unsupported_reasons=[token_warn] if token_warn else [],
+            suggestion=sug, token_hint=token_hint,
         )
 
     return CapabilityResult(
-        ok=True,
-        status="ok",
-        required_apis=sorted(required),
-        missing_apis=[],
-        matched_rules=matched_rules,
-        unsupported_reasons=[token_warn] if token_warn else [],
-        suggestion="数据能力检查通过，可启动编排。" + (f" 注意: {token_warn}" if token_warn else ""),
+        ok=True, status="ok", required_apis=sorted(required), missing_apis=[],
+        matched_rules=matched_rules, unsupported_reasons=[token_warn] if token_warn else [],
+        suggestion="数据能力检查通过，可启动编排。" + (f" 注意: {token_warn}" if token_warn else ""), token_hint=token_hint,
     )
 
 

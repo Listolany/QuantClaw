@@ -477,6 +477,36 @@ quant-claw-push/
 
 ---
 
+### #20 — monitor重启后图表/交易/统计全部丢失显示空白 (run 20260308_164103)
+**日期**：2026-03-09  
+**现象**：收益曲线图badge显示"完成"但图表内容为空，每日盈亏为空，交易记录为空  
+**根因链**：回测完成 → monitor自动停止(KEEPALIVE到期) → 用户访问需重启monitor → `_recover_state()` 仅从 `state.json` 恢复status/requirement/steps → **图表数据(final)、交易(trades)、统计(stats)、策略代码(code)全未恢复** → SSE发送done但无数据事件 → 前端badge显示完成但所有图表/表格为空  
+**修复**：`monitor_server.py` `_recover_state()` 增加从 `report_data.json` 恢复 `final`(dates/navs/bench)、`trades`、`stats`，从 `strategy_snapshot.py` 恢复策略代码  
+**验证**：重启monitor后Playwright确认：519日期点+744笔交易+收益曲线+每日收益图全部正常渲染
+
+---
+
+### #21 — Portfolio模式回测过程中收益曲线/每日盈亏始终为空（逐日动态增长失效）
+**日期**：2026-03-09  
+**现象**：回测执行中收益曲线始终为空，不是只在完成后/恢复时为空；与"逐日动态增长"要求完全不符  
+**根因链**：Portfolio模式 `_portfolio_eod()` 依赖 `getattr(strat, "total_value", 0)` 获取组合净值 → **`total_value` 不是 vnpy_portfoliostrategy.StrategyTemplate 的标准属性** → getattr 永远返回 0 → `if tv > 0` 永远 False → **整个回测期间零净值点推送**；对比CTA模式手动计算 `capital + realized + unrealized` 无条件推送  
+**修复**：`backtest_runner.py` `_portfolio_eod()` 改为手动计算组合净值：`cash`(增量跟踪交易现金流) + `pos_val`(Σ持仓量×`engine.bars[s].close_price`) → nav = (cash + pos_val) / capital → **无条件推送** `/api/point`  
+**影响范围**：仅 Portfolio 模式，CTA 模式完全不受影响  
+**关联**：#20 修复的是"完成后重启丢数据"，本条修复的是"执行中就不推数据"
+
+---
+
+### #22 — position_snapshots/report_urls/positions 未持久化，重启后"每日持仓变化"永远为空
+**日期**：2026-03-09  
+**现象**：monitor重启后"每日持仓变化"卡片始终显示"等待持仓数据"；报告链接按钮消失  
+**根因链**：`backtest_runner.py` 在CTA/Portfolio模式中通过 `/api/position_snapshot` 推送每日持仓快照，但**只推到 monitor 内存，从不写入磁盘文件**；`report_data.json` 也不包含 `position_snapshots` 字段；`report_urls` 在 `state.json→payload` 中存在但 `_recover_state` 未读取  
+**修复**：  
+①`backtest_runner.py`：在 `_flush_eod`(CTA) 和 `_portfolio_eod`(Portfolio) 中同时积累 `state["pos_snaps"]`，并通过 `_save_report_data` 写入 `report_data.json`  
+②`monitor_server.py`：`_recover_state` 从 `report_data.json` 恢复 `position_snapshots`，从最后一个快照派生 `positions`，从 `state.json→payload` 恢复 `report_urls`  
+**完整持久化覆盖**：全部18个STATE字段中，仅 `logs`(低优先级，存在于backtest.log) 未恢复
+
+---
+
 ## 附录：关键环境变量
 
 | 变量 | 用途 | 示例 |

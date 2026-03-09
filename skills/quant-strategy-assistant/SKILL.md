@@ -2,12 +2,16 @@
 name: quant-strategy-assistant
 description: "量化策略助手：自然语言→策略生成→回测→优化→QMT模拟/实盘。三轮交互闭环。"
 metadata:
+  requires:
+    bins: ["python3"]
   openclaw:
     requires:
       bins: ["python3"]
 ---
 
 # 量化策略助手
+
+> **兼容说明**：本文档既是 OpenClaw Skill，也可作为任意 AI Agent 的操作手册。只要 Agent 能读取文件、执行命令、生成代码，即可按下方协议使用。YAML 头部的 `metadata.openclaw` 为 OpenClaw 平台专用字段，其他 Agent 忽略即可。
 
 回测三轮交互闭环 → 用户按需选择参数优化 / 模拟实盘。
 
@@ -94,9 +98,9 @@ DEFAULT_PRICETICK = 0.01
 配置指南: https://gitee.com/GuojinQuant/quant-claw#第四步配置环境变量
 一键诊断: `python3 "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" config-doctor`
 
-关键变量（优先从 `.env` / 环境变量 / `OPENCLAW_CONTROL_URL` 自动推导，不需要写死）：
+关键变量（优先从 `.env` / 环境变量自动推导，不需要写死）：
 - `QUANTCLAW_ROOT`：项目根目录（兼容 `QMT_PROJECT_ROOT`）
-- `MONITOR_PUBLIC_BASE`：监控公网基址（可留空，由 `OPENCLAW_CONTROL_URL` 推导）
+- `MONITOR_PUBLIC_BASE`：监控公网基址（可留空；OpenClaw 环境下可由 `OPENCLAW_CONTROL_URL` 自动推导）
 - `ORCH_MONITOR_PORT_CANDIDATES`：白名单端口（默认 `8767`，必须在防火墙放通）
 - `QGDATA_TOKEN`：数据 Token（可选；未配置时自动使用内置共享试用Token，有每日额度限制）
 
@@ -108,7 +112,7 @@ DEFAULT_PRICETICK = 0.01
 
 - 回测请求走三轮交互协议（见下方工作流）。
 - 编排器路径：`"${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py"`。
-- 严禁调用 workspace 下的 `.html` 报告文件。
+- 严禁读取或引用历史报告文件（`.html`/`.png`/`.json`），只使用 orchestrator 的 `status` 命令输出获取结果。
 - 策略代码由 agent 在第 2 轮使用 LLM 生成，写入 `${QUANTCLAW_ROOT}/strategies/` 目录。
 - 禁止在首条回复前做长轮询。
 - 监控页是透明主通道，聊天页只给里程碑与结论。
@@ -125,12 +129,18 @@ DEFAULT_PRICETICK = 0.01
 
 按优先级定位 `QUANTCLAW_ROOT`：
 
-1. `echo "${QUANTCLAW_ROOT:-$QMT_PROJECT_ROOT}"`，非空且包含 `backtests/pipeline_orchestrator.py` → 使用
-2. 若为空，自动发现：
+1. 检查环境变量 `QUANTCLAW_ROOT`（兼容 `QMT_PROJECT_ROOT`），非空且包含 `backtests/pipeline_orchestrator.py` → 使用。
+2. 若为空，跨平台自动发现：
 ```bash
-for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator.py" -path "*/backtests/*" 2>/dev/null; done | head -1
+python3 -c "
+from pathlib import Path
+for base in [Path('/opt'), Path.home(), Path('C:/'), Path('D:/')]:
+    if not base.exists(): continue
+    for p in base.rglob('backtests/pipeline_orchestrator.py'):
+        print(p.parent.parent); break
+" 2>/dev/null | head -1
 ```
-取结果的 `parents[1]` 作为项目根目录，后续命令用该绝对路径。
+取输出作为项目根目录，后续命令用该绝对路径。
 3. 都找不到 → 返回 `status=config_missing` + 配置指南链接 + `config-doctor` 命令。**禁止降级为手动脚本。**
 
 编排器脚本内置路径回退（`Path(__file__).parents[1]`），即使环境变量未设置，只要找到脚本就能正常运行。
@@ -151,10 +161,12 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 ```
 3. **确认并引导**：回复至少包含：
    - 已理解的参数摘要（标的/周期/信号/方向）
+   - 若 `data_capability_guard` 输出含 `token_hint`（非空字符串），**必须**在确认摘要之后、引导词之前如实告知用户。这表示检测到 Portfolio 策略 +（未传 Token 将回退共享试用 Token / 正在使用共享试用 Token）的组合，数据调用量大可能触发频率限制。直接呈现 `token_hint` 内容即可，不要包装为广告
    - 明确引导用户触发下一轮：
 
 ```
 需求已确认：{标的} / {模式cta或portfolio} / {日线/分钟线} / {做多/做空} / {回测区间或"引擎默认最近1年"}
+{若有token_hint则在此呈现，无则省略此行}
 请回复「开始生成」，我来为你生成策略代码并提交回测。
 ```
 
@@ -169,17 +181,40 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 
 **第 2 轮速度约束（强制）**：
 - **禁止**重跑 `data_capability_guard`（第 1 轮已检查）
-- **禁止**单独跑 `py_compile`（submit 内部已含编译+静态检查+预导入）
+- **禁止**单独跑 `py_compile`（submit 内部已含编译+静态检查+冒烟测试）
 - 理想路径 **2 次工具调用**：① 写策略文件 ② submit
-- submit **编译/lint 快速失败**（秒级退出，输出含 `compile_error` 或 `lint_error`）→ **在 Round 2 内立即修复**：读错误 → 改文件 → 重新 submit，最多 3 轮
-- submit 因运行时/超时/数据失败（已跑数分钟）→ **不在 Round 2 重试**，回复用户 run_id + monitor_url，在第 3 轮处理
+- submit **同步等待预检**（compile→lint→dryrun，通常 10~60 秒）再返回结果：
+  - 预检通过 → 返回 `status: "accepted"` + `monitor_url`（回测已在后台运行）
+  - 预检失败 → 返回 `status: "lint_error"/"compile_error"/"dryrun_error"` + `error` + `strategy_file`（**不返回 monitor_url**）
+- 预检失败时 **在 Round 2 内立即修复**：
+  1. **先告知用户**当前情况（如"检测到 import 路径错误，正在自动修复..."），保持透明
+  2. 读 `error` + `strategy_file` → 修复代码 → 重新 submit
+  3. 最多 **6 轮**修复重试，超过交由用户决策
+- submit 返回 `accepted` 后若回测运行时/超时/数据失败 → 已有 `monitor_url`，在第 3 轮处理
 
 1. **生成策略代码**（agent 使用 LLM 能力，直接写入文件）：
    - 根据 `parsed["mode"]` 选择正确模板：
      - `cta` → 继承 `CtaTemplate`，`on_bar(self, bar)`，`self.buy(price, vol)` / `self.sell(price, vol)`，`self.pos`，初始化用 `self.load_bar(N)`（**单数**，N=bar 数量）
      - `portfolio` → 继承 `StrategyTemplate`（vnpy_portfoliostrategy），`on_bars(self, bars: dict)`，`self.buy(vt_symbol, price, vol)` / `self.sell(vt_symbol, price, vol)`，`self.get_pos(vt_symbol)`，初始化用 `self.load_bars(days)`（**复数**，days=天数）
    - **严禁混用**：CTA 策略禁止用 `load_bars`，Portfolio 策略禁止用 `load_bar`
-   - **仓位计算（强制）**：使用 `self.available_cash`（引擎自动注入的可用现金）计算买入量，禁止使用固定 capital。引擎自动管理资金扣减/回款
+   - **仓位计算（强制——用户未指定时默认全仓）**：
+     - 用户明确说了手数/股数/仓位比例 → 按用户要求
+     - 用户未提仓位 → **默认全仓**（用 `self.available_cash` 动态计算最大可买手数）
+     - **绝对禁止** `fixed_size = 100` 或任何硬编码固定股数作为默认仓位（这是 vnpy 教程示例值，不是真实交易逻辑）
+     - CTA 全仓计算参考：
+       ```python
+       vol = int(self.available_cash / (bar.close_price * 1.0003)) // 100 * 100  # 主板100股整数倍
+       if vol >= 100:
+           self.buy(bar.close_price, vol)
+       ```
+     - Portfolio 等权全仓参考：
+       ```python
+       per_capital = self.available_cash / max(len(target_symbols), 1)
+       vol = int(per_capital / (bar.close_price * 1.0003)) // 100 * 100
+       if vol >= 100:
+           self.buy(vt_symbol, bar.close_price, vol)
+       ```
+     - 引擎会自动管理资金扣减/回款，并在资金不足时自动调减到可买最大手数
    - **账户属性（引擎自动注入，策略直接用）**：
      - `self.available_cash` — 可用现金（买入扣减，卖出回款）
      - `self.total_value` — 账户总值（现金+持仓市值）
@@ -214,11 +249,15 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
   --monitor-port-candidates "${ORCH_MONITOR_PORT_CANDIDATES:-8767}" \
   --timeout-sec 1200
 ```
-   - submit 内部自动执行：py_compile → _lint_strategy → _preflight_import → 启动回测
-   - 编译/lint 快速失败（秒级退出）→ 在 Round 2 内读错误、改代码、重新 submit（最多 3 轮）
-   - 运行时/超时/数据失败（已跑数分钟）→ 回复 run_id + monitor_url，第 3 轮处理
+   - submit 内部同步执行预检：py_compile → _lint_strategy → _preflight_import → dryrun
+   - 预检通过后自动启动回测，返回 `status: "accepted"` + `monitor_url`
+   - 预检失败返回 `status: "<error_type>"` + `error` + `strategy_file`，**不启动回测、不返回 monitor_url**
+   - agent 判断 submit 输出：
+     - `status == "accepted"` → 进入步骤 3（回复用户）
+     - `status` 为 `compile_error`/`lint_error`/`dryrun_error` → **先输出一句话告知用户**（如"检测到 xxx 错误，正在修复第 N/6 次..."）→ 读 error + strategy_file → 修复代码 → 重新 submit（最多 6 轮）
+     - 6 轮后仍失败 → 将最后一次错误信息告知用户，交由用户决策
 
-3. **回复用户**（低延迟首响）：
+3. **回复用户**（仅在 submit 返回 `accepted` 后）：
    - `run_id` + `monitor_url` + 当前状态
    - 引导词（必须覆盖两个语义点）：
      - A：打开监控页实时查看策略代码/曲线/交易
@@ -247,14 +286,24 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 |-----------|------|-----------:|
 | `compile_error` | py_compile 失败 | 读 strategy_file + traceback → LLM 修复代码 → 重新提交 |
 | `lint_error` | 静态检查 blocker（如 am.ma()、vnpy.trading 导入） | 同 compile_error 处理 |
+| `dryrun_error` | 冒烟测试失败（50根K线采样回放运行时异常） | 同 compile_error 处理：读 strategy_file + traceback → LLM 修复 → 重新提交 |
 | `runtime_error` | 回测运行时异常 | 读 strategy_file + traceback → LLM 分析修复 → 重新提交 |
 | `compat_error` | 引擎兼容性（如 portfolio+WEEKLY 未降级） | 提示用户调整参数，通常不应出现（parse_requirement 已自动降级） |
 | `data_error` | 数据加载失败/为空 | 提示用户检查标的代码/日期范围/token |
 | `config_error` | 环境/配置问题 | 提示用户检查配置 |
 | `timeout_error` | 超时 | 建议缩短日期范围或标的数量 |
 
-- 只对 `compile_error`、`lint_error` 和 `runtime_error` 尝试自动修复，其余直接报告用户。
-- 自动修复最多 3 轮，超过交由用户决策。
+- 只对 `compile_error`、`lint_error`、`dryrun_error` 和 `runtime_error` 尝试自动修复，其余直接报告用户。
+- Round 2 预检失败（compile/lint/dryrun）自动修复最多 **6 轮**；Round 3 运行时修复最多 **3 轮**。超过交由用户决策。
+
+3.5 **结果校验告警（status=completed 时优先检查）**：
+
+`status` 输出中若包含 `result_warnings` 字段（非空列表），说明回测结果校验发现语义异常：
+- 读 `result_warnings` + `strategy_file` → LLM 分析是否为策略 bug
+  - 若判断为 bug → 修复策略代码 → 重新提交
+  - 若判断为正常行为（如趋势策略在熊市期间无反向信号）→ 照常输出结果，附带告警说明
+
+常见告警类型：零交易、单边信号（有买无卖/有卖无买）、胜率极端值（100%/0%）。
 
 4. **完成后引导**（status=completed 时必须附带）：
 
@@ -297,7 +346,7 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 
 ## 配置前置校验（强制）
 
-- 执行 `submit` 前必须保证存在公网基址：优先 `MONITOR_PUBLIC_BASE`，为空时允许由 `OPENCLAW_CONTROL_URL` 自动推导。
+- 执行 `submit` 前必须保证存在公网基址：优先 `MONITOR_PUBLIC_BASE`，为空时允许由 `OPENCLAW_CONTROL_URL` 等环境变量自动推导。
 - 若未配置：直接返回 `status=config_missing`。
 - `QGDATA_TOKEN` 未配置时系统自动使用内置共享试用 Token（每日有限额度），无需阻断。
 - 若 submit 返回 `status=data_auth_failed`，说明数据服务额度不足或权限不够，提示用户：
@@ -318,15 +367,15 @@ for d in /opt /root /home; do find "$d" -maxdepth 5 -name "pipeline_orchestrator
 
 ## 幂等重试
 
-自动修复最多3轮，超过则交由用户决策。
+Round 2 预检修复最多 6 轮，Round 3 运行时修复最多 3 轮，超过则交由用户决策。
 
 ---
 
 ## 绝对禁止清单（违反任何一条 = 严重事故）
 
 ### 链路禁止
-- **禁止**在 workspace 下创建 `.html` 报告文件
-- **禁止**读取、搜索、引用 workspace 下的 `reports/` 目录
+- **禁止**在项目目录或工作目录下创建 `.html` 报告文件
+- **禁止**读取、搜索、引用 `reports/` 目录下的历史文件
 - **禁止**直接调用 `backtest_runner.py`、`monitor_server.py`、`/api/code`
 - **禁止**使用 `python -m http.server` 或任何临时 HTTP 服务
 - **禁止**生成临时回测脚本或手工拼接回测执行流程

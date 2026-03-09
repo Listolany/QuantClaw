@@ -90,7 +90,9 @@ pip install -e QMT-TradingClaw/vnpy_qmt
 3. 在控制台获取个人 `token`
 4. 配置为环境变量 `QGDATA_TOKEN`，或在 OpenClaw 对话中直接说"我的token是 xxx"
 
-> 试用额度用完时系统会提示：`当日额度已达上限，去 quantgo.ai/data 解锁更多能力`。
+> 若首次需求被识别为 Portfolio（多标的轮动/组合）且未传 Token（将回落共享试用 Token）或正在使用共享试用 Token，第一轮确认会提前提示频率风险，避免回测中途受限。
+>
+> 若当天免费额度已用完，`submit` 会明确返回：`今日免费额度已用完（1次/天）。升级数据套餐可解除限制：https://quantgo.ai/data`。
 
 ## 第四步：配置环境变量
 
@@ -136,7 +138,54 @@ $env:QC_POOL_MAX_STOCKS = "500"
 
 </details>
 
-## 第五步：执行一次自动编排回测
+## 第五步：安装 OpenClaw Skill（一句话触发回测）
+
+将仓库中的 Skill 文件复制到 OpenClaw 的 workspace 目录即可：
+
+```bash
+# 复制 quant-strategy-assistant 技能到 OpenClaw workspace
+cp -r skills/quant-strategy-assistant ~/.openclaw/workspace/skills/
+```
+
+> **注意**：不要使用软链接（`ln -s`），OpenClaw 的安全机制会拒绝加载指向 workspace 外部的软链接。必须用 `cp -r` 复制实体文件。
+
+安装后验证：
+
+```bash
+# 查看已安装技能列表，确认 quant-strategy-assistant 状态为 ✓ ready
+openclaw skills list
+```
+
+输出中应能看到：
+
+```
+│ ✓ ready   │ 📦 quant-strategy-assistant │ 量化策略助手：自然语言→策略生成→回测→优化→... │ openclaw-workspace │
+```
+
+如果状态为 `✗ missing`，运行以下命令排查缺失项：
+
+```bash
+openclaw skills check
+```
+
+> **更新 Skill**：当开源包有新版本时，重新执行 `cp -r` 覆盖即可。
+
+### 非 OpenClaw Agent 使用方式
+
+如果你使用其他 AI Agent（MiniMax Agent、Claude Desktop 等），不需要安装 OpenClaw Skill，直接将 `skills/quant-strategy-assistant/SKILL.md` 作为 prompt 或参考文档提供给你的 Agent 即可。
+
+前提条件：
+- Agent 能读取本地文件
+- Agent 能执行 `python` 命令并获取输出
+- 已完成第一步到第四步的环境配置
+
+Agent 需要执行的核心命令与 OpenClaw 完全一致：
+- `python QMT-TradingClaw/backtests/pipeline_orchestrator.py submit --requirement "..." ...`
+- `python QMT-TradingClaw/backtests/pipeline_orchestrator.py status --run-id "..."`
+
+SKILL.md 中的三轮交互协议、策略生成规范、错误分流表对任何 Agent 通用。
+
+## 第六步：执行一次自动编排回测（命令行方式）
 
 先做能力闸门检查：
 
@@ -162,7 +211,7 @@ $env:QC_POOL_MAX_STOCKS = "500"
 
 打开 `monitor_url` 即可实时查看整个执行过程。
 
-## 第六步：查看结果摘要
+## 第七步：查看结果摘要
 
 如果你只想要文本摘要，可以按 `run_id` 查询：
 
@@ -184,6 +233,7 @@ $env:QC_POOL_MAX_STOCKS = "500"
 - 检查 `QGDATA_TOKEN` 是否正确、是否过期。
 - 检查 qgdata 账户是否已开通 Pro，且当前策略涉及的接口已授权。
 - 如额度用尽或需要升级，前往 [https://quantgo.ai/data](https://quantgo.ai/data) 充值。
+- 若共享免费额度已耗尽，submit 会返回：`今日免费额度已用完（1次/天）。升级数据套餐可解除限制：https://quantgo.ai/data`。
 - 系统会在监控页显示⚠️警告并附带充值链接，点击即可跳转。
 
 ### 3）为什么策略没跑起来，提示 LLM 相关错误
