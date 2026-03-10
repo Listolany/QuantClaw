@@ -1455,9 +1455,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
     monitor_url = f"{_scheme}://{_host_fmt}:{monitor_port}/runs/{run_id}"
     monitor_url_local = f"http://127.0.0.1:{monitor_port}/runs/{run_id}"
     report_public_base = normalize_public_base(args.report_public_base)
-    report_url = public_url(report_public_base, f"{run_id}.html")
-    report_replay_url = public_url(report_public_base, f"{run_id}_replay.html")
-    report_summary_url = public_url(report_public_base, f"{run_id}_summary.json")
+    _report_prefix = f"run_{run_id}"
+    _report_base_via_monitor = f"{_scheme}://{_host_fmt}:{monitor_port}/reports"
+    report_url = public_url(report_public_base, f"{run_id}.html") or f"{_report_base_via_monitor}/{_report_prefix}_report.html"
+    report_replay_url = public_url(report_public_base, f"{run_id}_replay.html") or f"{_report_base_via_monitor}/{_report_prefix}_replay.html"
+    report_summary_url = public_url(report_public_base, f"{run_id}_summary.json") or f"{_report_base_via_monitor}/{_report_prefix}_summary.json"
     public_reachable = False
     public_probe_error = "probe_pending"
     strategy_file = ""
@@ -1962,6 +1964,16 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     state = RunStore(args.run_id).load()
+    payload = state.get("payload", {})
+    if isinstance(payload, dict) and not payload.get("report_url"):
+        monitor_url = payload.get("monitor_url", "")
+        if monitor_url and "/runs/" in monitor_url:
+            base = monitor_url.split("/runs/", 1)[0]
+            prefix = f"run_{state.get('run_id', args.run_id)}"
+            payload["report_url"] = f"{base}/reports/{prefix}_report.html"
+            payload["report_replay_url"] = f"{base}/reports/{prefix}_replay.html"
+            payload["report_summary_url"] = f"{base}/reports/{prefix}_summary.json"
+            state["payload"] = payload
     errors = state.get("errors", [])
     if errors:
         last = errors[-1]
@@ -1981,7 +1993,12 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "status": st.get("status"),
                 "updated_at": st.get("updated_at"),
                 "monitor_url": st.get("payload", {}).get("monitor_url"),
-                "report_url": st.get("payload", {}).get("report_url"),
+                "report_url": st.get("payload", {}).get("report_url")
+                or (
+                    f"{st.get('payload', {}).get('monitor_url', '').split('/runs/', 1)[0]}/reports/run_{st['run_id']}_report.html"
+                    if "/runs/" in st.get("payload", {}).get("monitor_url", "")
+                    else ""
+                ),
             }
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2))

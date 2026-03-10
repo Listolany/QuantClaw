@@ -569,6 +569,27 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK: self.wfile.write(json.dumps({"filename": STATE.get("code_file",""), "content": STATE.get("code","")}, ensure_ascii=False).encode())
         elif path == "/api/health":
             self._json_ok()
+        elif path.startswith("/reports/"):
+            name = (path.split("/reports/", 1)[1] or "").strip("/")
+            allow_suffix = (".html", ".json", ".png")
+            if (
+                not name
+                or "/" in name
+                or ".." in name
+                or not name.startswith("run_")
+                or not name.endswith(allow_suffix)
+            ):
+                self.send_response(400); self.end_headers(); return
+            fp = os.path.join(os.path.dirname(__file__), name)
+            if not os.path.isfile(fp):
+                self.send_response(404); self.end_headers(); return
+            ctype = "application/octet-stream"
+            if name.endswith(".html"): ctype = "text/html; charset=utf-8"
+            elif name.endswith(".json"): ctype = "application/json; charset=utf-8"
+            elif name.endswith(".png"): ctype = "image/png"
+            self.send_response(200); self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-cache, no-store"); self.end_headers()
+            with open(fp, "rb") as f: self.wfile.write(f.read())
         else:
             self.send_response(404); self.end_headers()
     def do_POST(self):
