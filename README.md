@@ -57,7 +57,7 @@ quant-claw/
 - [ ] 已安装 OpenClaw（用于加载 `skills/quant-strategy-assistant`）
 - [ ] 已配置一个可用的 LLM API（OpenAI 兼容接口即可）
 - [ ] 已获取 `QGDATA_TOKEN`（可选；未配置时使用内置共享试用Token）
-- [ ] 有一个可公网访问的 IP/域名（用于监控链接）
+- [ ] 有一个可公网访问的 IP/域名（云端部署需要；Windows 本地自用可走本地模式）
 - [ ] 安全组/防火墙放通监控白名单端口（默认 `8767`）
 - [ ] 若要模拟盘/实盘，已安装并启动 QMT 交易端（系统自动检测可用性）
 
@@ -102,14 +102,15 @@ pip install -e QMT-TradingClaw/vnpy_qmt
 # 1. 复制模板
 cp .env.example QMT-TradingClaw/.env
 
-# 2. 编辑填入你的值（至少填 QGDATA_TOKEN 和 MONITOR_PUBLIC_BASE）
+# 2. 编辑填入你的值（至少填 QGDATA_TOKEN；MONITOR_PUBLIC_BASE 视部署方式）
 vim QMT-TradingClaw/.env
 
 # 3. 一键诊断，确认全部 PASS
 python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor
 ```
 
-> `config-doctor` 会逐项检查 QUANTCLAW_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。全市场/大样本回测默认最多抽样 500 只股票，可用 `QC_POOL_MAX_STOCKS` 调整。
+> `config-doctor` 会逐项检查 QUANTCLAW_ROOT、PYTHON_BIN、MONITOR_PUBLIC_BASE、端口连通性、QGDATA_TOKEN 等，FAIL 项会给出修复提示。  
+> 本地模式说明：默认仅 Windows 自动识别为本地模式（可不填 `MONITOR_PUBLIC_BASE`，监控链接走 `127.0.0.1`）；Linux/macOS 若需本地模式请显式设置 `MONITOR_LOCAL_MODE=1`。全市场/大样本回测默认最多抽样 500 只股票，可用 `QC_POOL_MAX_STOCKS` 调整。
 
 <details>
 <summary>如果不想用 .env 文件，也可以直接 export（点击展开）</summary>
@@ -123,6 +124,8 @@ export QGDATA_TOKEN="你的qgdata_token"
 export MONITOR_PUBLIC_BASE="http://你的公网IP或域名"
 export ORCH_MONITOR_PORT_CANDIDATES="8767"
 export QC_POOL_MAX_STOCKS="500"
+# 本地自用（可选）：不走公网探测，直接返回 127.0.0.1 监控链接
+# export MONITOR_LOCAL_MODE="1"
 ```
 
 ### Windows（PowerShell）
@@ -134,6 +137,8 @@ $env:QGDATA_TOKEN = "你的qgdata_token"
 $env:MONITOR_PUBLIC_BASE = "http://你的公网IP或域名"
 $env:ORCH_MONITOR_PORT_CANDIDATES = "8767"
 $env:QC_POOL_MAX_STOCKS = "500"
+# Windows 本地自用可不填 MONITOR_PUBLIC_BASE；也可显式使用 localhost
+# $env:MONITOR_PUBLIC_BASE = "http://127.0.0.1"
 ```
 
 </details>
@@ -224,7 +229,8 @@ SKILL.md 中的三轮交互协议、策略生成规范、错误分流表对任�
 ### 1）监控链接打不开
 
 - 运行 `python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py config-doctor` 一键诊断。
-- 确认 `MONITOR_PUBLIC_BASE` 是公网地址，不是 `localhost`/`0.0.0.0`/内网 IP。
+- 云端部署：确认 `MONITOR_PUBLIC_BASE` 是公网地址，不是 `localhost`/`0.0.0.0`/内网 IP。
+- 本地部署：Windows 默认本地模式，可直接打开 `monitor_url_local`（`127.0.0.1`）；Linux/macOS 本地自用请设置 `MONITOR_LOCAL_MODE=1`。
 - 确认安全组/防火墙放通白名单端口（默认 `8767`，通过 `ORCH_MONITOR_PORT_CANDIDATES` 配置）。
 - 端口采用白名单策略：只使用你显式声明的端口，公网不可达时 submit 会立即失败并提示原因，不会出现"回测成功但监控页打不开"的情况。
 

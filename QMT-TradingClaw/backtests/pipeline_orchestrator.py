@@ -8,6 +8,7 @@ import io
 import ipaddress
 import json
 import os
+import platform
 import signal
 import re
 import shutil
@@ -703,22 +704,33 @@ def probe_monitor_url(url: str, timeout: float = 2.0) -> Tuple[bool, str]:
         return False, f"url_error:{exc}"
 
 
+def _is_local_mode(resolved_base: str = "") -> bool:
+    """根据已解析的 base URL 判定是否为本地部署模式；空值 + Windows 也视为本地"""
+    if os.getenv("MONITOR_LOCAL_MODE", "").strip().lower() in {"1", "true", "yes", "on"}: return True #显式强制本地模式
+    val = (resolved_base or "").strip()
+    if not val: return platform.system() == "Windows" #未解析出任何 base 且 Windows→本地
+    host = urlparse(val).hostname or ""
+    return platform.system() == "Windows" and host in {"127.0.0.1", "localhost", "0.0.0.0"} #仅Windows默认认定localhost
+
 def validate_monitor_public_base(base: str) -> Tuple[bool, str]:
     val = (base or "").strip().rstrip("/")
+    local = _is_local_mode(val)
     if not val:
+        if local: return True, "local_mode"
         return False, "MONITOR_PUBLIC_BASE is required"
     parsed = urlparse(val)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return False, "MONITOR_PUBLIC_BASE must be a valid http(s) base URL"
     host = parsed.hostname or ""
     if host in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        if local: return True, "local_mode"
         return False, "MONITOR_PUBLIC_BASE must be publicly reachable (not localhost/0.0.0.0)"
     try:
         ip = ipaddress.ip_address(host)
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+            if local: return True, "local_mode"
             return False, "MONITOR_PUBLIC_BASE points to a non-public IP"
     except ValueError:
-        # Hostname/domain is allowed; reachability is checked later by probe_monitor_url.
         pass
     return True, ""
 
@@ -1432,7 +1444,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
         }, ensure_ascii=False))
         return 1
     monitor_base = f"http://127.0.0.1:{monitor_port}"
-    monitor_url = f"{resolved_monitor_public_base.rstrip('/')}:{monitor_port}/runs/{run_id}"
+    _local = _is_local_mode(resolved_monitor_public_base)
+    _effective_base = resolved_monitor_public_base.rstrip('/') if resolved_monitor_public_base else "http://127.0.0.1"
+    _pu = urlparse(_effective_base if "://" in _effective_base else f"http://{_effective_base}") #规范化，避免 base 已含端口/路径导致 URL 畸形
+    _host = _pu.hostname or "127.0.0.1"
+    _host_fmt = f"[{_host}]" if ":" in _host and not _host.startswith("[") else _host
+    _scheme = _pu.scheme or "http"
+    monitor_url = f"{_scheme}://{_host_fmt}:{monitor_port}/runs/{run_id}"
     monitor_url_local = f"http://127.0.0.1:{monitor_port}/runs/{run_id}"
     report_public_base = normalize_public_base(args.report_public_base)
     report_url = public_url(report_public_base, f"{run_id}.html")
@@ -1512,25 +1530,35 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(json.dumps({"status": "error", "error": "monitor startup failed", "run_id": run_id}, ensure_ascii=False))
         return 1
 
-    public_reachable, public_probe_error = probe_monitor_url(monitor_url, timeout=3.0)
+    if _local: #本地模式：probe localhost 即可，不要求公网可达
+        public_reachable, public_probe_error = probe_monitor_url(monitor_url_local, timeout=3.0)
+        if not public_reachable: #连本地都不通，说明 monitor 启动失败
+            try: mon_proc.kill()
+            except Exception: pass
+            state["status"] = "failed"
+            store.append_error(state, f"monitor本地不可达: {public_probe_error}")
+            store.save(state)
+            print(json.dumps({"status": "error", "error": f"monitor 启动异常（本地不可达）: {public_probe_error}", "monitor_port": monitor_port}, ensure_ascii=False))
+            return 1
+    else: #云端模式：公网 probe
+        public_reachable, public_probe_error = probe_monitor_url(monitor_url, timeout=3.0)
+        if not public_reachable:
+            try: mon_proc.kill()
+            except Exception: pass
+            state["status"] = "failed"
+            store.append_error(state, f"monitor公网不可达: {public_probe_error}")
+            store.save(state)
+            print(json.dumps({
+                "status": "config_missing",
+                "error": f"monitor_url 公网不可达: {monitor_url} ({public_probe_error})",
+                "monitor_port": monitor_port,
+                "next_action": f"请确认: 1) MONITOR_PUBLIC_BASE 指向正确的公网地址; 2) 防火墙/安全组已放通端口 {monitor_port}; 3) 运行 config-doctor 一键诊断: python3 pipeline_orchestrator.py config-doctor",
+            }, ensure_ascii=False))
+            return 1
     payload["monitor_public_reachable"] = public_reachable
     payload["monitor_public_probe_error"] = public_probe_error
     state["payload"] = payload
     store.save(state)
-
-    if not public_reachable:
-        try: mon_proc.kill()
-        except Exception: pass
-        state["status"] = "failed"
-        store.append_error(state, f"monitor公网不可达: {public_probe_error}")
-        store.save(state)
-        print(json.dumps({
-            "status": "config_missing",
-            "error": f"monitor_url 公网不可达: {monitor_url} ({public_probe_error})",
-            "monitor_port": monitor_port,
-            "next_action": f"请确认: 1) MONITOR_PUBLIC_BASE 指向正确的公网地址; 2) 防火墙/安全组已放通端口 {monitor_port}; 3) 运行 config-doctor 一键诊断: python3 pipeline_orchestrator.py config-doctor",
-        }, ensure_ascii=False))
-        return 1
 
     monitor_post(monitor_base, "/api/requirement", {"requirement": args.requirement, **parsed, "run_id": run_id})
     if parsed.get("pool_warning"):
@@ -2065,15 +2093,20 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
     _check("PYTHON_BIN", py_ok, py, f"找不到 {py}，请安装或修正路径" if not py_ok else "OK")
 
     mpb = resolve_monitor_public_base("")
-    mpb_valid, mpb_err = validate_monitor_public_base(mpb) if mpb else (False, "未配置")
-    _check("MONITOR_PUBLIC_BASE", mpb_valid, mpb, mpb_err if not mpb_valid else "OK")
+    mpb_valid, mpb_err = validate_monitor_public_base(mpb)
+    _local_doc = _is_local_mode(mpb)
+    if _local_doc:
+        _check("MONITOR_PUBLIC_BASE", True, mpb or "(本地模式，自动使用 127.0.0.1)", "本地部署模式，无需公网地址")
+    else:
+        _check("MONITOR_PUBLIC_BASE", mpb_valid, mpb or "(空)", mpb_err if not mpb_valid else "OK")
 
     ports_raw = os.getenv("ORCH_MONITOR_PORT_CANDIDATES", ",".join(str(p) for p in DEFAULT_MONITOR_PORTS))
     ports = [int(x) for x in ports_raw.split(",") if x.strip().isdigit()]
-    if mpb_valid and ports:
+    if _local_doc: #本地模式跳过公网端口连通性测试
+        _warn("端口公网可达", ports_raw, "本地模式，跳过公网端口探测（仅需浏览器访问 127.0.0.1）")
+    elif mpb_valid and ports:
         port_results = []
         for p in ports:
-            test_url = f"{mpb.rstrip('/')}:{p}/"
             try:
                 with socket.create_connection((urlparse(mpb).hostname or "", p), timeout=2.0):
                     port_results.append((p, True, ""))
