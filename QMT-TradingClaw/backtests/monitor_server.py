@@ -282,9 +282,9 @@ es.addEventListener('step',e=>{const d=JSON.parse(e.data);addLog('['+d.step+'] '
 });
 es.addEventListener('requirement',e=>{const d=JSON.parse(e.data);setBadge('b1','success');
   const el=document.getElementById('c1');el.classList.remove('empty');
-  const km={symbols:'标的',fast_window:'快线周期',slow_window:'慢线周期',interval:'K线周期',direction:'方向',mode:'策略模式',requirement:'需求描述',run_id:'运行ID'};
-  const vm={bullish:'看涨',bearish:'看跌',DAILY:'日线',MINUTE:'分钟线',HOUR:'小时线',WEEKLY:'周线',cta:'CTA单标的',portfolio:'Portfolio组合'};
-  const isP=d.mode==='portfolio';const skip=isP?new Set(['fast_window','slow_window','direction','pool_warning','data_blocked','start','end']):new Set(['pool_warning','data_blocked','start','end']);
+  const km={symbols:'标的',interval:'K线周期',mode:'策略模式',requirement:'需求描述',run_id:'运行ID',fast_window:'快线周期',slow_window:'慢线周期',direction:'方向',k_period:'K周期',d_period:'D周期',j_threshold:'J阈值',rsi_period:'RSI周期',boll_window:'布林窗口',boll_dev:'布林偏差',macd_fast:'MACD快线',macd_slow:'MACD慢线',macd_signal:'MACD信号',atr_period:'ATR周期',cci_window:'CCI窗口',trailing_pct:'追踪止损%',stop_loss:'止损%',take_profit:'止盈%'};
+  const vm={bullish:'看涨',bearish:'看跌',DAILY:'日线','5MIN':'5分钟',MINUTE:'分钟线','15MIN':'15分钟','30MIN':'30分钟',HOUR:'小时线',WEEKLY:'周线',cta:'CTA单标的',portfolio:'Portfolio组合'};
+  const skip=new Set(['pool_warning','data_blocked','_ma_fallback']);
   let h='<div class="req-grid">';for(const[k,v] of Object.entries(d)){if(skip.has(k)||!v)continue;const lbl=km[k]||k;const val=Array.isArray(v)?v.join(', '):(vm[v]||v);h+='<div class="req-item"><div class="k">'+lbl+'</div><div class="v">'+val+'</div></div>'}
   el.innerHTML=h+'</div>'});
 let _codeContent='',_codeFilename='strategy.py';
@@ -681,7 +681,8 @@ def _recover_state(run_id):
             if s.get("status") == "failed": STATE["status"] = "failed"; STATE["done"] = True; STATE["pct"] = 100
             elif s.get("status") in ("completed", "done"): STATE["status"] = "done"; STATE["done"] = True; STATE["pct"] = 100
             req = {**s.get("payload", {}), **s.get("payload", {}).get("parsed", {})}
-            STATE["requirement"] = {k: v for k, v in req.items() if k in ("requirement", "symbols", "fast_window", "slow_window", "interval", "direction", "mode", "run_id")}
+            _skip = {"parsed","payload","capability_check","monitor_base","monitor_port","monitor_public_base","monitor_public_reachable","monitor_public_probe_error","report_public_base","report_public_dir","report_url","report_replay_url","report_summary_url","python_bin","qgdata_token_present","qgdata_token_source","timeout_sec","strategy_file","strategy_module","strategy_class","pool_warning","data_blocked","_ma_fallback","monitor_url","monitor_url_local","start","end","capital","rate","slippage","size","pricetick","title"}
+            STATE["requirement"] = {k: v for k, v in req.items() if k not in _skip and v and not k.startswith("_")}
             if isinstance(STATE["requirement"].get("symbols"), list): STATE["requirement"]["symbols"] = f"共{len(STATE['requirement']['symbols'])}只标的"
             errs = s.get("errors", [])
             if errs:

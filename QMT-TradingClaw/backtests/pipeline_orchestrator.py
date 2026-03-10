@@ -571,14 +571,12 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     result: Dict[str, Any] = {"symbols": symbols}
     if pool_warn: result["pool_warning"] = pool_warn
     if pool_api_failed: result["data_blocked"] = True
-    if is_ma:
+    if is_ma: #双均线专属参数，仅供内置兜底模板使用，不暴露给监控页
         windows = [int(m.group(1)) for m in re.finditer(r"(\d+)\s*日", txt)]
-        if len(windows) >= 2:
-            result["fast_window"], result["slow_window"] = sorted(windows[:2])
-        elif len(windows) == 1:
-            result["fast_window"], result["slow_window"] = max(5, windows[0] // 2), windows[0]
-        else:
-            result["fast_window"], result["slow_window"] = 5, 10
+        if len(windows) >= 2: fw, sw = sorted(windows[:2])
+        elif len(windows) == 1: fw, sw = max(5, windows[0] // 2), windows[0]
+        else: fw, sw = 5, 10
+        result["_ma_fallback"] = {"fast_window": fw, "slow_window": sw}
 
     min_match = re.search(r"(\d+)\s*分钟|(\d+)\s*min", txt, re.IGNORECASE)
     if any(k in txt for k in ["60分钟", "小时", "hour", "1h", "60min"]):
@@ -592,7 +590,7 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
         interval = "WEEKLY"
     else:
         interval = "DAILY"
-    direction = "bearish" if any(k in txt for k in ["下穿", "死叉"]) else "bullish"
+    _direction = "bearish" if any(k in txt for k in ["下穿", "死叉"]) else "bullish" #仅兜底模板用
     _strong_kw = ["轮动", "组合", "多标的", "portfolio", "多只", "全市场", "等权", "仓位分配"] #任一即portfolio
     _weak_kw = ["排序", "筛选", "选股", "调仓", "排列", "持仓周期"] #需配合pool上下文
     _pool_re = re.compile(r"板块|成分股|指数|行业|概念|股票池")
@@ -602,7 +600,8 @@ def parse_requirement(requirement: str, symbols_override: Optional[str], token: 
     mode = "portfolio" if (len(symbols) > 1 or _has_strong or (_has_pool and _has_weak)) else "cta"
     if mode == "portfolio" and interval == "WEEKLY": #引擎驱动不支持WEEKLY，自动降为DAILY（策略内部可用pro.weekly()取周线数据）
         interval = "DAILY"; print("[parse] portfolio+WEEKLY → 引擎驱动降为DAILY（周线数据策略可通过pro.weekly()直接获取）")
-    result.update({"interval": interval, "direction": direction, "mode": mode})
+    result.update({"interval": interval, "mode": mode})
+    result.setdefault("_ma_fallback", {})["direction"] = _direction #兜底模板专属
     dr = _parse_date_range(txt) #日期关键词兜底解析
     if dr:
         result["start"], result["end"] = dr
@@ -1021,7 +1020,8 @@ def generate_report_html(*, run_id: str, report_data: Dict, summary: Dict, strat
     stats_json = json.dumps(stats, ensure_ascii=False)
     code_escaped = _html.escape(strategy_code or "")
     p = parsed or {}
-    meta = {k: str(v) for k, v in {**p, "run_id": run_id}.items() if v}
+    meta = {k: str(v) for k, v in {**p, "run_id": run_id}.items() if v and not k.startswith("_")}
+    for _skip_k in ("pool_warning", "data_blocked"): meta.pop(_skip_k, None)
     meta_json = json.dumps(meta, ensure_ascii=False)
     return f'''<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1131,7 +1131,9 @@ window._tp=function(n){{pg=n;render()}};render()
 }})();
 /* --- info --- */
 (function(){{
-let h='';for(const[k,v] of Object.entries(M))h+='<div class="info-item"><div class="ik">'+k+'</div><div class="iv">'+v+'</div></div>';
+const _km={{symbols:'标的',interval:'K线周期',mode:'策略模式',requirement:'需求描述',run_id:'运行ID',fast_window:'快线周期',slow_window:'慢线周期',direction:'方向',k_period:'K周期',d_period:'D周期',rsi_period:'RSI周期',boll_window:'布林窗口',macd_fast:'MACD快线',macd_slow:'MACD慢线',atr_period:'ATR周期'}};
+const _vm={{DAILY:'日线','5MIN':'5分钟','15MIN':'15分钟','30MIN':'30分钟',HOUR:'小时线',WEEKLY:'周线',cta:'CTA单标的',portfolio:'Portfolio组合',bullish:'看涨',bearish:'看跌'}};
+let h='';for(const[k,v] of Object.entries(M))h+='<div class="info-item"><div class="ik">'+(_km[k]||k)+'</div><div class="iv">'+(_vm[v]||v)+'</div></div>';
 document.getElementById('infoGrid').innerHTML=h||'<div style="color:#94a3b8">无额外信息</div>'}})();
 hljs.highlightAll();
 function _cpCode(){{const c=document.querySelector('#p-code code');const t=c?c.textContent:'';const b=document.getElementById('cpBtn');function _ok(){{b.classList.add('copied');b.textContent='✓ 已复制';setTimeout(()=>{{b.classList.remove('copied');b.textContent='📋 复制代码'}},1500)}}function _fb(){{const ta=document.createElement('textarea');ta.value=t;ta.style.cssText='position:fixed;left:-9999px';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);_ok()}}if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(_ok).catch(_fb)}}else{{_fb()}}}}
@@ -1560,7 +1562,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     state["payload"] = payload
     store.save(state)
 
-    monitor_post(monitor_base, "/api/requirement", {"requirement": args.requirement, **parsed, "run_id": run_id})
+    _req_display = {k: v for k, v in parsed.items() if not k.startswith("_")} #排除 _ma_fallback 等内部字段
+    monitor_post(monitor_base, "/api/requirement", {"requirement": args.requirement, **_req_display, "run_id": run_id})
     if parsed.get("pool_warning"):
         monitor_step(monitor_base, step="1", status="warning", title="数据源警告", msg=parsed["pool_warning"], run_id=run_id)
     monitor_step(monitor_base, step="1", status="success", title="需求确认", msg="监控页面已启动", run_id=run_id)
@@ -1715,11 +1718,13 @@ def cmd_worker(args: argparse.Namespace) -> int:
             module_name = f"auto_ma_{run_id}".lower()
             class_name = "AutoMaCrossStrategy" if bt_mode == "cta" else "AutoPortfolioStrategy"
             strategy_file_path = STRATEGIES_DIR / f"{module_name}.py"
-            fw, sw = parsed.get("fast_window", 5), parsed.get("slow_window", 10)
+            _maf = parsed.get("_ma_fallback", {})
+            fw, sw = _maf.get("fast_window", 5), _maf.get("slow_window", 10)
+            _dir = _maf.get("direction", "bullish")
             if bt_mode == "portfolio":
-                source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"], [s for s in (normalize_symbol(x) for x in parsed["symbols"]) if s])
+                source = portfolio_strategy_source(class_name, fw, sw, "quant-strategy-assistant", _dir, [s for s in (normalize_symbol(x) for x in parsed["symbols"]) if s])
             else:
-                source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", parsed["direction"])
+                source = strategy_source(class_name, fw, sw, "quant-strategy-assistant", _dir)
             source, import_fixes = _autofix_imports(source, bt_mode)
             if import_fixes: print(f"[autofix] import修正: {'; '.join(import_fixes)}")
             strategy_file_path.write_text(source, encoding="utf-8")
