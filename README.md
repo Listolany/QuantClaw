@@ -297,3 +297,9 @@ python3 QMT-TradingClaw/backtests/pipeline_orchestrator.py qmt-check
 - `.env` 已在 `.gitignore` 中，不会被提交；`.env.example` 不含真实密钥，可以提交。
 - 上云部署时，建议使用环境变量注入密钥，不要硬编码在脚本中。
 - 部署后运行 `config-doctor` 确认配置无误再使用。
+
+## 社区与支持
+由祛魅量化(QuantGo)维护 一 致力于将量化投资的门槛一撸到底（只要你有交易想法）。
+微信公众号/小红书 一 搜索“李斯托拉尼”
+欢迎关注，我会不定期更新各种好用的AI量化工具。
+
