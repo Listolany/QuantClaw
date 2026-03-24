@@ -20,7 +20,7 @@ from vnpy_xt.qg_datafeed import QgDatafeed
 BASE = str((PROJECT_ROOT / "backtests").resolve())
 sys.path.insert(0, BASE)
 LOCK = os.path.join(BASE, ".run_lock")
-from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error, mask_token
+from qg_constants import QGDATA_RECHARGE_URL, classify_qgdata_error, mask_token, qg_throttle, qg_call
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 MONITOR = ""  # http://127.0.0.1:port（启用时设置）
 
@@ -82,7 +82,7 @@ def validate_token(token, total_stages):
         stage(1, total_stages, "failed", "qgdata token为空或格式异常"); p(f"  订阅地址: {QGDATA_RECHARGE_URL}"); sys.exit(1)
     try:
         import qgdata as qg; qg.set_token(token.strip()); pro = qg.pro_api(timeout=15.0)
-        pro.daily(ts_code="000001.SZ", start_date="20250101", end_date="20250110")
+        qg_call(lambda: pro.daily(ts_code="000001.SZ", start_date="20250101", end_date="20250110"))
         stage(1, total_stages, "success", "qgdata token检查通过")
     except Exception as e:
         code, user_msg = classify_qgdata_error(e)
@@ -106,7 +106,7 @@ def _load_stock_names(token: str = ""):
         t = token or os.getenv("QGDATA_TOKEN", "")
         if not t: return
         qg.set_token(t); pro = qg.pro_api(timeout=15.0)
-        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
+        df = qg_call(lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code,name"))
         if df is not None and not df.empty:
             for _, r in df.iterrows():
                 ts = str(r["ts_code"]); nm = str(r["name"])
@@ -271,6 +271,7 @@ def load_data(symbols_exchanges, interval, start, end, token, total_stages):
             if not datafeed.init(): stage(2, total_stages, "failed", "qgdata初始化失败"); sys.exit(1)
         p(f"  [{i+1}/{n}] {vts}: 本地不足，下载中...")
         req = HistoryRequest(symbol=sym, exchange=ex, interval=interval, start=start, end=end)
+        qg_throttle()
         bars = datafeed.query_bar_history(req)
         if bars: db.save_bar_data(bars); p(f"  [{i+1}/{n}] {vts}: 下载{len(bars)}根K线"); ok += 1
         else: p(f"  [{i+1}/{n}] {vts}: 无数据(下载返回空)")
@@ -477,7 +478,7 @@ def _load_trade_calendar(start, end):
         qg.set_token(token); pro = qg.pro_api(timeout=15.0)
         s = (start - timedelta(days=30)).strftime("%Y%m%d")
         e = (end + timedelta(days=30)).strftime("%Y%m%d")
-        df = pro.trade_cal(exchange='SSE', start_date=s, end_date=e, is_open='1')
+        df = qg_call(lambda: pro.trade_cal(exchange='SSE', start_date=s, end_date=e, is_open='1'))
         cal = set(df['cal_date'].tolist()) if df is not None and not df.empty else set()
         p(f"[日历] 交易日历已加载: {len(cal)}个交易日")
         return cal
@@ -530,7 +531,7 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
             sdate, edate = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
             vt_set = set(vt_symbols or [])
             try:  #优先批量查询（1次API调用），本地过滤到本次标的
-                df = pro.suspend_d(start_date=sdate, end_date=edate, suspend_type='S', fields="ts_code,trade_date,suspend_type")
+                df = qg_call(lambda: pro.suspend_d(start_date=sdate, end_date=edate, suspend_type='S', fields="ts_code,trade_date,suspend_type"))
                 if df is not None and not df.empty:
                     for r in df.itertuples(index=False):
                         vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
@@ -543,7 +544,7 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
                     qc = _vn2qg(vt)
                     if not qc: continue
                     try:
-                        df = pro.suspend_d(ts_code=qc, start_date=sdate, end_date=edate, fields="ts_code,trade_date,suspend_type")
+                        df = qg_call(lambda qc=qc: pro.suspend_d(ts_code=qc, start_date=sdate, end_date=edate, fields="ts_code,trade_date,suspend_type"))
                         if df is None or df.empty: continue
                         for r in df.itertuples(index=False):
                             t = str(getattr(r, "trade_date", "") or ""); ty = str(getattr(r, "suspend_type", "") or "").upper()
@@ -563,7 +564,7 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
             limit_cache[date_s] = mp; return mp
         try:
             try:
-                df = pro.stk_limit(ts_code=",".join(qcodes), trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit")
+                df = qg_call(lambda: pro.stk_limit(ts_code=",".join(qcodes), trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit"))
                 if df is not None and not df.empty:
                     for r in df.itertuples(index=False):
                         vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
@@ -571,7 +572,7 @@ def _patch_order_guards(engine, mode, vt_symbols, start, end):
             except Exception:
                 for qc in qcodes:
                     try:
-                        df = pro.stk_limit(ts_code=qc, trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit")
+                        df = qg_call(lambda qc=qc: pro.stk_limit(ts_code=qc, trade_date=date_s, fields="trade_date,ts_code,up_limit,down_limit"))
                         if df is None or df.empty: continue
                         for r in df.itertuples(index=False):
                             vt = _qg2vn(str(getattr(r, "ts_code", "") or ""))
@@ -813,7 +814,7 @@ def _load_hs300(start, end):
         if bars: return pd.Series([b.close_price for b in bars], index=[b.datetime for b in bars]).sort_index()
         import qgdata as qg; pro = qg.pro_api(timeout=15.0)
         ds, de = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-        df = pro.daily(ts_code="000300.SH", start_date=ds, end_date=de)
+        df = qg_call(lambda: pro.daily(ts_code="000300.SH", start_date=ds, end_date=de))
         if df is not None and not df.empty:
             df = df.sort_values("trade_date"); return pd.Series(df["close"].astype(float).tolist(), index=pd.to_datetime(df["trade_date"]).tolist())
         return _load_hs300_public(ds, de)

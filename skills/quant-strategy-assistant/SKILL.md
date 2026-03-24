@@ -67,16 +67,7 @@ metadata:
 - 缺少资金账号 → 提示通过 `--account-id` 或 `QMT_ACCOUNT_ID` 提供
 - `ready=true` → 进入第 2 步
 
-**第 1.5 步：探针验证**（可选，独立验证下单链路，不依赖策略）
-
-```bash
-"${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" probe \
-  --symbol "{标的代码,如600519.SSE}" --account-id "{资金账号}"
-```
-
-发送 100 股跌停附近买单 → QMT 委托列表可见 → 自动撤单。用户在 QMT 终端看到委托闪现即确认通信正常。此步骤可跳过，因为 `trade` 命令内部也会自动执行探针。
-
-**第 2 步：启动交易**
+**第 2 步：启动交易**（内含自动探针验证：100股跌停价挂单→确认→撤单，可选单独跑 `probe --symbol {代码} --account-id {账号}`）
 
 ```bash
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" trade \
@@ -94,19 +85,7 @@ metadata:
 "${PYTHON_BIN}" "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" trade-stop --run-id "{run_id}"
 ```
 
-**交易启动内部流程**（trade_runner 执行顺序，用户可见摘要）：
-1. 连接 QMT 交易端（路径自动发现）
-2. 探针单验证下单链路（100 股跌停附近挂单→确认→撤单）
-3. 加载策略类 + 注入 BarGenerator（tick→日线聚合）
-4. 加载历史数据预热 ArrayManager
-5. 启动策略，接收实时行情并自动交易
-
-所需用户配置（仅模拟/实盘时，回测无关）：
-
-| 项目 | 方式 | 说明 |
-|------|------|------|
-| QMT 路径 | **自动发现** | 扫描各盘符下含 `userdata_mini` 的 QMT 目录，也可通过 `QMT_PATH` 环境变量覆盖 |
-| 资金账号 | `--account-id` 或 `QMT_ACCOUNT_ID` | 券商资金账号（仅此一项需用户提供） |
+仅需用户提供 **资金账号**（`--account-id` 或 `QMT_ACCOUNT_ID`）；QMT 路径自动扫描各盘符下 `userdata_mini` 目录（可通过 `QMT_PATH` 覆盖）。
 
 ## 环境
 
@@ -120,19 +99,9 @@ metadata:
 | 实盘交易 | miniQMT (xt_gateway.py)，需 QMT 交易端已启动 |
 | Python解释器 | `PYTHON_BIN`（默认 `python3`） |
 
-```python
-DEFAULT_CAPITAL = 1000000
-DEFAULT_RATE = 0.0003
-DEFAULT_SLIPPAGE = 0.01
-DEFAULT_SIZE = 1
-DEFAULT_PRICETICK = 0.01
-```
+回测默认参数：`capital=1000000 / rate=0.0003 / slippage=0.01 / size=1 / pricetick=0.01`
 
-### 配置（不写死地址，开源友好）
-
-仓库自带 `.env.example`，用户只需 `cp .env.example QMT-TradingClaw/.env` 并填值。
-配置指南: https://gitee.com/GuojinQuant/quant-claw#第四步配置环境变量
-一键诊断: `python3 "${QUANTCLAW_ROOT}/backtests/pipeline_orchestrator.py" config-doctor`
+配置指南: https://gitee.com/GuojinQuant/quant-claw#第四步配置环境变量 （仓库自带 `.env.example`）
 
 关键变量（优先从 `.env` / 环境变量自动推导，不需要写死）：
 - `QUANTCLAW_ROOT`：项目根目录（兼容 `QMT_PROJECT_ROOT`）
@@ -152,6 +121,7 @@ DEFAULT_PRICETICK = 0.01
 - 策略代码由 agent 在第 2 轮使用 LLM 生成，写入 `${QUANTCLAW_ROOT}/strategies/` 目录。
 - 禁止在首条回复前做长轮询。
 - 监控页是透明主通道，聊天页只给里程碑与结论。
+- 失败时必须回复 `status` + `error` + `next_action`，禁止只说"失败了"不给下一步。
 - 实盘能力保留，默认不进入实盘；用户请求模拟/实盘时执行 `qmt-check` 检测。
 - 触发词分四类：
   - **回测第1轮**：`回测`、`策略`、`自动编排`、`均线`、`上穿`、`下穿`、`买入`、`卖出` → 进入三轮交互协议
@@ -161,23 +131,27 @@ DEFAULT_PRICETICK = 0.01
 
 ---
 
-## 第 0 步：定位项目根目录（每次会话首次触发时执行一次）
+## 第 0 步：环境预检（每次会话首次触发时执行一次）
 
-按优先级定位 `QUANTCLAW_ROOT`：
+运行 Skill 内置预检脚本（`scripts/preflight.py`，相对于本 Skill 目录）。脚本内部使用 `sys.executable` 自适应解释器，直接调用即可：
 
-1. 检查环境变量 `QUANTCLAW_ROOT`（兼容 `QMT_PROJECT_ROOT`），非空且包含 `backtests/pipeline_orchestrator.py` → 使用。
-2. 若为空，跨平台自动发现：
+Linux/macOS：
 ```bash
-python3 -c "
-from pathlib import Path
-for base in [Path('/opt'), Path.home(), Path('C:/'), Path('D:/')]:
-    if not base.exists(): continue
-    for p in base.rglob('backtests/pipeline_orchestrator.py'):
-        print(p.parent.parent); break
-" 2>/dev/null | head -1
+python3 "<本Skill目录>/scripts/preflight.py"
 ```
-取输出作为项目根目录，后续命令用该绝对路径。
-3. 都找不到 → 返回 `status=config_missing` + 配置指南链接 + `config-doctor` 命令。**禁止降级为手动脚本。**
+Windows PowerShell：
+```powershell
+python "<本Skill目录>\scripts\preflight.py"
+```
+
+输出 JSON，按字段消费：
+- `ready=true` → 取 `engine_root` 作为 `QUANTCLAW_ROOT`，进入第 1 轮
+- `ready=false` + `engine_found=true` → 依赖缺失，向用户展示 `blockers` 和 `fix_cmd`
+- `ready=false` + `engine_found=false` → 引擎未找到，返回 `status=config_missing` + 配置指南链接。**禁止降级为手动脚本。**
+- `hints` 非空 → 非阻塞提示（如 Token 状态），向用户如实展示
+- 预检通过后可选执行 `doctor_cmd` 做深度配置诊断（端口/Token/公网等）
+
+退出码：`0`=就绪　`1`=引擎未找到　`2`=依赖缺失可修复
 
 编排器脚本内置路径回退（`Path(__file__).parents[1]`），即使环境变量未设置，只要找到脚本就能正常运行。
 
@@ -377,33 +351,6 @@ for base in [Path('/opt'), Path.home(), Path('C:/'), Path('D:/')]:
 3. **展示结果**：输出 JSON 含 `best`（最优参数+指标）和 `results`（Top N），agent 以表格形式呈现。
 
 4. **后续选择**：用户可选择用最优参数重新回测验证，或继续调整参数范围。
-
----
-
-## 配置前置校验（强制）
-
-- 执行 `submit` 前必须保证存在公网基址：优先 `MONITOR_PUBLIC_BASE`，为空时允许由 `OPENCLAW_CONTROL_URL` 等环境变量自动推导。
-- 若未配置：直接返回 `status=config_missing`。
-- `QGDATA_TOKEN` 未配置时系统自动使用内置共享试用 Token（每日有限额度），无需阻断。
-- 若 submit 返回 `status=data_auth_failed`，说明数据服务额度不足或权限不够，提示用户：
-  - 前往 [quantgo.ai/data](https://quantgo.ai/data) 获取个人 Token 或升级套餐。
-  - 也可在对话中直接贴 Token（系统会自动提取）。
-
-## 失败快照
-
-失败时回复最少字段：`status` + `error` + `next_action`。禁止只说"失败了"不给下一步。
-
-## 超时
-
-| 操作 | 超时 |
-|------|------|
-| 数据下载 | 60s |
-| 回测执行 | 600s |
-| 实盘连接（预留） | 60s |
-
-## 幂等重试
-
-Round 2 预检修复最多 6 轮，Round 3 运行时修复最多 3 轮，超过则交由用户决策。
 
 ---
 

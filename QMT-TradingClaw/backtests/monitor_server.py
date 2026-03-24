@@ -41,7 +41,7 @@ def broadcast(event, data):
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>策略监控</title>
-<script defer src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+<script defer src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js" onerror="this.onerror=function(){this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'};this.src='https://unpkg.com/echarts@5.5.0/dist/echarts.min.js'"></script>
 <link rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/styles/atom-one-light.min.css" onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/atom-one-light.min.css'">
 <script defer src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/highlight.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js'"></script>
 <script defer src="https://cdn.bootcdn.net/ajax/libs/highlight.js/11.9.0/languages/python.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/languages/python.min.js'"></script>
@@ -222,14 +222,14 @@ function _ensureChart(){ //确定性渲染：从API拉取完整数据，不依�
     const daily=[],dds=[];
     for(let i=1;i<ch.navs.length;i++){const p=ch.navs[i-1]||1;daily.push(parseFloat(((ch.navs[i]-p)/p*100).toFixed(3)));dds.push(ch.dates[i])}
     dailyOpt.xAxis.data=dds;dailyOpt.series[0].data=daily;
-    if(dailyChart){dailyChart.setOption(dailyOpt,true);dailyChart.resize()}
+    if(dailyChart){dailyChart.setOption(dailyOpt,true);dailyChart.resize();setBadge('b4','success')}
     setTimeout(()=>{if(chart){chart.resize();chart.setOption(chartOpt,true)}if(dailyChart){dailyChart.resize();dailyChart.setOption(dailyOpt,true)}},500) //延迟二次强制重绘
   }).catch(()=>{})}
 let _echartsRetry=0;
 function _initCharts(){
   if(chart)return;
   if(typeof echarts==='undefined'){_echartsRetry++;
-    if(_echartsRetry>=20){const ce=document.getElementById('chart');if(ce&&!ce.querySelector('.chart-fallback')){ce.innerHTML='<div class="chart-fallback" style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;flex-direction:column"><p>图表库加载超时</p><button onclick="location.reload()" style="margin-top:8px;padding:6px 16px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;color:#3b82f6">点击刷新</button></div>'}}
+    if(_echartsRetry>=35){const ce=document.getElementById('chart');if(ce&&!ce.querySelector('.chart-fallback')){ce.innerHTML='<div class="chart-fallback" style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;flex-direction:column"><p>图表库加载超时</p><button onclick="location.reload()" style="margin-top:8px;padding:6px 16px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;color:#3b82f6">点击刷新</button></div>'}}
     setTimeout(_initCharts,500);return}
   try{chart=echarts.init(document.getElementById('chart'),null,{renderer:'canvas'});dailyChart=echarts.init(document.getElementById('dailyChart'),null,{renderer:'canvas'});
     if(chart){chart.setOption(chartOpt);chart.resize()}if(dailyChart){dailyChart.setOption(dailyOpt);dailyChart.resize()}addLog('📈 图表库加载完成');_ensureChart();
@@ -354,7 +354,8 @@ es.addEventListener('stats',e=>{const d=JSON.parse(e.data);setBadge('b5','succes
 es.addEventListener('trades',e=>{const d=JSON.parse(e.data);tradeData=d.trades||[];currentPage=1;renderTrades()});
 es.addEventListener('log',e=>{const d=JSON.parse(e.data);addLog(d.msg||'')});
 es.addEventListener('done',e=>{const g=document.getElementById('gpill');g.className='pill pill-s';g.textContent='已完成';STATE_DONE=true;
-  setBadge('b3','success');setBadge('b5',_warnRendered?'warning':'success');setTL(6,_warnRendered?'warning':'success');addLog('✅ 全部完成')});
+  setBadge('b3','success');setBadge('b5',_warnRendered?'warning':'success');setTL(6,_warnRendered?'warning':'success');addLog('✅ 全部完成');
+  if(dailyChart&&dailyOpt.series[0].data.length>0){setBadge('b4','success')}else{_ensureChart()}});
 es.addEventListener('report_urls',e=>{const d=JSON.parse(e.data);const url=d.report_url||'';
   if(url){document.getElementById('rptLink').href=url;document.getElementById('rptBan').style.display='block'}});
 es.addEventListener('error_info',e=>{const d=JSON.parse(e.data);
@@ -506,13 +507,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             try:
                 _hb = 0
-                while not STATE["done"]:
+                # done后仍保持SSE连接，避免浏览器自动重连触发事件回放导致日志重复刷屏
+                while True:
                     time.sleep(1); _hb += 1
                     if _hb >= 15:
                         _hb = 0
                         try: self.wfile.write(b": heartbeat\n\n"); self.wfile.flush()
                         except Exception: break
-                time.sleep(5)
             except Exception: pass
         elif path == "/api/step":
             self._json_ok()

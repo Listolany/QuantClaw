@@ -22,8 +22,17 @@ quant-claw/
 ├── README.md
 ├── skills/
 │   └── quant-strategy-assistant/
-│       ├── SKILL.md
-│       └── qgdata-reference.md
+│       ├── SKILL.md                      # 回测编排流程
+│       ├── qgdata-reference.md           # Agent决策速查（关键词→API映射）
+│       ├── scripts/
+│       │   └── preflight.py              # 环境预检（定位引擎+校验依赖）
+│       └── references/
+│           ├── SDK_USER_API.md           # 接口总目录+通用调用规范
+│           ├── SDK_USER_API_STK_MINS.md  # 分钟线专版文档
+│           └── apis/                     # 154个接口详情文档
+│               ├── daily.md
+│               ├── fund_daily.md
+│               └── ...
 └── QMT-TradingClaw/
     ├── backtests/
     │   ├── pipeline_orchestrator.py
@@ -189,6 +198,27 @@ Agent 需要执行的核心命令与 OpenClaw 完全一致：
 - `python QMT-TradingClaw/backtests/pipeline_orchestrator.py status --run-id "..."`
 
 SKILL.md 中的三轮交互协议、策略生成规范、错误分流表对任何 Agent 通用。
+
+## 第五步半：环境预检（可选但推荐）
+
+Skill 内置了 `scripts/preflight.py`，一条命令完成引擎定位 + 依赖校验：
+
+```bash
+# Linux/macOS
+python3 ~/.openclaw/workspace/skills/quant-strategy-assistant/scripts/preflight.py
+
+# Windows PowerShell
+python "$env:USERPROFILE\.openclaw\workspace\skills\quant-strategy-assistant\scripts\preflight.py"
+```
+
+输出 JSON，关注三个字段：
+- `ready=true` → 环境就绪，可直接回测
+- `blockers` → 列出所有阻塞项
+- `fix_cmd` → 对应的修复命令，复制执行即可
+
+退出码：`0` 就绪　`1` 引擎未找到　`2` 依赖缺失可修复
+
+> 预检通过后可继续执行输出中的 `doctor_cmd` 做深度诊断（端口连通性/Token/公网等）。
 
 ## 第六步：执行一次自动编排回测（命令行方式）
 

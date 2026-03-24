@@ -13,21 +13,49 @@ from typing import Any, Dict, List, Set
 
 # Baseline capability list from SDK_USER_API.md (documented interfaces).
 DOCUMENTED_APIS: Set[str] = {
+    #基础数据
     "stock_basic", "stk_premarket", "trade_cal", "stock_st", "st", "stock_hsgt",
     "namechange", "stock_company", "stk_managers", "stk_rewards", "bse_mapping", "new_share", "bak_basic",
+    #行情数据
     "stk_mins", "daily", "stk_weekly_monthly", "stk_week_month_adj", "weekly", "monthly",
     "adj_factor", "daily_basic", "stk_limit", "suspend_d", "stk_auction", "stk_auction_o", "stk_auction_c",
+    #ETF专题
+    "etf_basic", "etf_stk_mins", "fund_adj", "fund_daily", "etf_index", "etf_share_size",
+    #公募基金
+    "fund_basic", "fund_company", "fund_manager", "fund_share", "fund_nav", "fund_div", "fund_portfolio", "fund_factor_pro",
+    #指数专题
+    "index_basic", "index_daily", "index_weekly", "index_monthly", "idx_mins", "index_dailybasic",
+    "index_weight", "index_classify", "index_member_all", "index_global", "idx_factor_pro",
+    "sw_daily", "ci_daily", "daily_info", "sz_daily_info",
+    #港股数据
+    "hk_basic", "hk_tradecal", "hk_daily", "hk_daily_adj", "hk_adjfactor", "hk_mins",
+    #沪深港通
     "hsgt_top10", "ggt_top10", "ggt_daily", "ggt_monthly",
+    #财务数据
     "income", "balancesheet", "cashflow", "forecast", "express", "dividend", "fina_indicator", "fina_audit",
     "fina_mainbz", "disclosure_date",
+    #股东与机构
     "top10_holders", "top10_floatholders", "pledge_stat", "pledge_detail", "repurchase", "share_float",
     "block_trade", "stk_holdernumber", "stk_holdertrade", "report_rc", "ccass_hold", "ccass_hold_detail", "hk_hold",
+    #技术指标与筹码
     "cyq_perf", "cyq_chips", "stk_factor_pro", "stk_nineturn", "stk_ah_comparison",
+    #融资融券与资金流向
     "margin_detail", "margin_secs", "margin", "slb_len",
     "moneyflow", "moneyflow_ths", "moneyflow_dc", "moneyflow_cnt_ths", "moneyflow_ind_ths",
     "moneyflow_ind_dc", "moneyflow_mkt_dc", "moneyflow_hsgt",
+    #龙虎榜与涨跌停
     "top_list", "top_inst", "limit_list_ths", "limit_list_d", "limit_step", "limit_cpt_list",
+    #板块与指数
     "ths_index", "ths_daily", "ths_member", "dc_index", "dc_member", "dc_daily", "tdx_index", "tdx_member", "tdx_daily",
+    #利率数据
+    "shibor", "shibor_quote", "shibor_lpr", "libor", "hibor", "wz_index", "gz_index",
+    #美国利率
+    "us_tycr", "us_trycr", "us_tbr", "us_tltr", "us_trltr",
+    #宏观经济
+    "cn_gdp", "cn_cpi", "cn_ppi", "cn_m", "sf_month", "cn_pmi",
+    #资讯与语料
+    "research_report", "news", "major_news", "cctv_news", "anns_d", "irm_qa_sh", "irm_qa_sz", "npr",
+    #其他
     "stk_surv", "broker_recommend", "hm_list", "hm_detail", "ths_hot", "dc_hot", "kpl_list", "kpl_concept_cons",
 }
 
@@ -54,11 +82,28 @@ KEYWORD_API_RULES: Dict[str, List[str]] = {
     "板块": ["ths_index", "ths_member", "dc_index", "dc_member", "tdx_index", "tdx_member"],
     "概念": ["ths_index", "ths_member", "dc_index", "dc_member"],
     "行业": ["ths_index", "ths_daily"],
-    "指数": ["ths_daily", "dc_daily", "tdx_daily"],
+    "指数": ["index_basic", "index_daily", "index_weekly", "index_monthly", "idx_mins", "index_dailybasic"],
     "港股通": ["ggt_daily", "ggt_monthly", "ggt_top10", "hsgt_top10"],
+    "港股": ["hk_basic", "hk_daily", "hk_mins"],
     "持股": ["hk_hold", "ccass_hold", "ccass_hold_detail"],
     "机构调研": ["stk_surv"],
     "热榜": ["ths_hot", "dc_hot"],
+    "ETF": ["etf_basic", "fund_daily", "etf_stk_mins"],
+    "基金": ["fund_basic", "fund_nav", "fund_daily", "fund_portfolio"],
+    "净值": ["fund_nav"],
+    "GDP": ["cn_gdp"],
+    "CPI": ["cn_cpi"],
+    "PPI": ["cn_ppi"],
+    "宏观": ["cn_gdp", "cn_cpi", "cn_ppi", "cn_m", "cn_pmi"],
+    "PMI": ["cn_pmi"],
+    "利率": ["shibor", "shibor_lpr", "libor", "hibor"],
+    "新闻": ["news", "major_news", "cctv_news"],
+    "研报": ["research_report"],
+    "公告": ["anns_d"],
+    "互动易": ["irm_qa_sh", "irm_qa_sz"],
+    "申万": ["sw_daily"],
+    "权重": ["index_weight"],
+    "美债": ["us_tycr", "us_trycr"],
 }
 
 # Keywords that usually imply out-of-scope or ambiguous requirement.
@@ -67,8 +112,7 @@ from qg_constants import QGDATA_RECHARGE_URL, QGDATA_SHARED_TOKEN, classify_qgda
 UNSUPPORTED_HINTS: Dict[str, str] = {
     "期权": "当前编排器默认股票策略，期权需要单独执行链路。",
     "期货": "当前编排器默认股票策略，期货需要单独执行链路。",
-    "新闻情绪": "SDK_USER_API 文档未声明新闻情绪接口，需改为热榜/资金流代理指标或接入外部源。",
-    "宏观": "SDK_USER_API 文档未声明宏观经济接口，需明确替代数据源。",
+    "舆情": "无社交媒体情绪分析API，建议用热榜/资金流代理指标或接入外部源。",
 }
 
 

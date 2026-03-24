@@ -142,7 +142,7 @@ def resolve_monitor_public_base(explicit_base: str) -> str:
     return ""
 
 
-from qg_constants import QGDATA_RECHARGE_URL, QGDATA_SHARED_TOKEN, QGDATA_TOKEN_RE, mask_token, classify_qgdata_error
+from qg_constants import QGDATA_RECHARGE_URL, QGDATA_SHARED_TOKEN, QGDATA_TOKEN_RE, mask_token, classify_qgdata_error, qg_call, qg_throttle
 
 
 def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], str]:
@@ -157,7 +157,7 @@ def resolve_symbols_by_name(requirement: str, token: str) -> tuple[list[str], st
     try:
         import qgdata as qg
         qg.set_token(token); pro = qg.pro_api(timeout=8.0)
-        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
+        df = qg_call(lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code,name"))
         if df is None or len(df) == 0:
             return [], f"qgdata API 返回空数据（查询股票名「{'、'.join(names[:3])}」），可能Token额度不足。充值地址: {QGDATA_RECHARGE_URL}"
         all_rows = [(str(r["name"]), str(r["ts_code"])) for _, r in df.iterrows()]
@@ -255,7 +255,7 @@ def _ths_member_symbols(ts_code: str, token: str) -> list[str]:
     """调用 ths_member 获取成分股代码列表（已 normalize）"""
     import qgdata as qg
     qg.set_token(token); pro = qg.pro_api(timeout=15)
-    df = pro.ths_member(ts_code=ts_code, fields="ts_code,con_code,con_name,is_new")
+    df = qg_call(lambda: pro.ths_member(ts_code=ts_code, fields="ts_code,con_code,con_name,is_new"))
     if df is None or df.empty:
         return []
     active = df[df["is_new"] == "Y"] if "is_new" in df.columns and not df[df["is_new"] == "Y"].empty else df
@@ -367,7 +367,7 @@ def _resolve_sector_members(sector_name: str, token: str) -> tuple[list[str], st
         qg.set_token(token); pro = qg.pro_api(timeout=15)
         best_code, best_name = None, None
         for tp in ("N", "I"):
-            df = pro.ths_index(exchange="A", type=tp, fields="ts_code,name")
+            df = qg_call(lambda: pro.ths_index(exchange="A", type=tp, fields="ts_code,name"))
             if df is None or df.empty:
                 continue
             exact = df[df["name"] == sector_name]
@@ -425,7 +425,7 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
     try:
         import qgdata as qg
         qg.set_token(token); pro = qg.pro_api(timeout=10)
-        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,market")
+        df = qg_call(lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,market"))
         if df is None or len(df) == 0:
             return [], f"「{matched}」选股：qgdata API 返回空数据，可能Token额度不足。充值地址: {QGDATA_RECHARGE_URL}"
         if matched == "科创板": df = df[df["market"] == "科创板"]
@@ -438,7 +438,8 @@ def _resolve_stock_pool(txt: str, token: str, max_stocks: int = 500) -> tuple[li
             try:
                 mv = None
                 for i in range(7):
-                    mv = pro.daily_basic(trade_date=(datetime.now() - timedelta(days=i)).strftime("%Y%m%d"), fields="ts_code,total_mv")
+                    _td = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+                    mv = qg_call(lambda: pro.daily_basic(trade_date=_td, fields="ts_code,total_mv"))
                     if mv is not None and not mv.empty: break
                 if mv is not None and not mv.empty:
                     mv = mv.drop_duplicates("ts_code").set_index("ts_code")
@@ -1849,6 +1850,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 raise TimeoutError(f"backtest timeout after {timeout_sec}s")
             time.sleep(2)
 
+        monitor_step(monitor_base, step="4", status="success", title="回测执行", msg="回测进程已结束", run_id=run_id) #与前端时间线 td3 对齐（此前仅有 running 无 success）
         summary_path = BACKTESTS_DIR / f"{output_prefix}_summary.json"
         if summary_path.exists():
             summary = read_json(summary_path)
@@ -2147,7 +2149,7 @@ def cmd_config_doctor(_args: argparse.Namespace) -> int:
             import qgdata as qg  # type: ignore
             qg.set_token(token)
             pro = qg.pro_api(timeout=5.0)
-            df = pro.stock_basic(exchange="", list_status="L", fields="ts_code", limit=1)
+            df = qg_call(lambda: pro.stock_basic(exchange="", list_status="L", fields="ts_code", limit=1))
             token_ok = df is not None and len(df) > 0
             _check("QGDATA_TOKEN", token_ok, f"{mask_token(token)}(来源:{token_src})", "Token 校验通过" if token_ok else f"Token 无效或接口无权限，请到 {QGDATA_RECHARGE_URL} 确认套餐或充值")
         except Exception as e:
